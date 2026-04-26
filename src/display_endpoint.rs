@@ -531,7 +531,7 @@ async fn forward_frame_ready(
     // gone anyway.
     if let Err(e) = renderer.submit_frame_record(FrameRecord {
         release_point,
-        consumer_handle,
+        consumer_handle: Some(consumer_handle),
         expected_count,
     }) {
         log::warn!(

@@ -14,6 +14,7 @@
 
 #include <gbm.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #ifndef DRM_FORMAT_MOD_LINEAR
 #define DRM_FORMAT_MOD_LINEAR 0ULL
@@ -30,6 +31,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
@@ -41,9 +43,18 @@
 namespace {
 
 constexpr uint32_t SLOT_COUNT          = 3;
-// DRM_FORMAT_ABGR8888 == fourcc('A','B','2','4'): memory order R,G,B,A.
-// This is what Mesa reports for a GL_RGBA8 texture exported as DMA-BUF.
-constexpr uint32_t DRM_FORMAT_ABGR8888 = 0x34324241u;
+// DRM fourcc constants. ABGR8888 (memory order R,G,B,A) matches GL_RGBA8
+// channel layout on Mesa, but some drivers only accept other fourccs as
+// non-external GL_TEXTURE_2D bind targets — so we probe at runtime
+// across the full 8888 family (cf. libfunnel's egl.c try_format()).
+constexpr uint32_t DRM_FORMAT_ABGR8888 = 0x34324241u; // 'A','B','2','4'
+constexpr uint32_t DRM_FORMAT_XBGR8888 = 0x34324258u; // 'X','B','2','4'
+constexpr uint32_t DRM_FORMAT_ARGB8888 = 0x34325241u; // 'A','R','2','4'
+constexpr uint32_t DRM_FORMAT_XRGB8888 = 0x34325258u; // 'X','R','2','4'
+constexpr uint32_t DRM_FORMAT_RGBA8888 = 0x41424752u; // 'R','G','B','A'
+constexpr uint32_t DRM_FORMAT_BGRA8888 = 0x41524742u; // 'B','G','R','A'
+constexpr uint32_t DRM_FORMAT_RGBX8888 = 0x58424752u; // 'R','G','B','X'
+constexpr uint32_t DRM_FORMAT_BGRX8888 = 0x58524742u; // 'B','G','R','X'
 
 struct Options {
     std::string ipc_path;
@@ -110,12 +121,20 @@ struct GlFns {
     PFNEGLCREATESYNCKHRPROC                  eglCreateSyncKHR { nullptr };
     PFNEGLDESTROYSYNCKHRPROC                 eglDestroySyncKHR { nullptr };
     PFNEGLDUPNATIVEFENCEFDANDROIDPROC        eglDupNativeFenceFDANDROID { nullptr };
+    PFNEGLQUERYDMABUFMODIFIERSEXTPROC        eglQueryDmaBufModifiersEXT { nullptr };
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC      glEGLImageTargetTexture2DOES { nullptr };
 };
 
 struct Slot {
-    GLuint         texture { 0 };
-    GLuint         fbo { 0 };
+    // Native GL_RGBA8 intermediate that mpv renders into. Decouples mpv's
+    // pipeline from any driver restriction on the DMA-BUF EGLImage (e.g.
+    // external_only modifiers that reject GL_TEXTURE_2D bind).
+    GLuint         mpv_texture { 0 };
+    GLuint         mpv_fbo { 0 };
+    // DMA-BUF-backed export target. Filled via glBlitFramebuffer from
+    // mpv_fbo each frame.
+    GLuint         export_texture { 0 };
+    GLuint         export_fbo { 0 };
     EGLImageKHR    egl_image { EGL_NO_IMAGE_KHR };
     struct gbm_bo* bo { nullptr };
     int            dmabuf_fd { -1 };
@@ -132,6 +151,13 @@ struct GlCtx {
     EGLContext         context { EGL_NO_CONTEXT };
     GlFns              fns;
     Slot               slots[SLOT_COUNT];
+    // Chosen via eglQueryDmaBufModifiersEXT at init (or legacy probe).
+    uint32_t           export_fourcc { 0 };
+    uint64_t           export_modifier { 0 };
+    // false ⇒ legacy NVIDIA-style path: gbm_bo_create(USE_LINEAR) and
+    // import without EGL modifier attrs. Used when EGL's importable
+    // modifier set has no overlap with GBM's producible set.
+    bool               use_explicit_modifier { true };
 };
 
 void* must_egl_proc(const char* name) {
@@ -144,26 +170,66 @@ bool egl_has_ext(const char* exts, const char* e) {
     return exts && std::strstr(exts, e) != nullptr;
 }
 
+// Open the DRM render node bound to the EGL display, falling back to
+// a known-paths scan. Pattern adopted from libfunnel/src/egl.c so EGL
+// and GBM end up on the same physical GPU on multi-GPU systems.
+// Must be called after eglInitialize.
 void open_render_node(GlCtx& gl) {
-    const char* nodes[] = {
-        "/dev/dri/renderD128",
-        "/dev/dri/renderD129",
-    };
-    for (const char* n : nodes) {
-        int fd = ::open(n, O_RDWR | O_CLOEXEC);
-        if (fd >= 0) {
-            gl.drm_fd = fd;
-            break;
+    const char* node = nullptr;
+    auto eglQueryDisplayAttribEXT_ =
+        reinterpret_cast<PFNEGLQUERYDISPLAYATTRIBEXTPROC>(
+            eglGetProcAddress("eglQueryDisplayAttribEXT"));
+    auto eglQueryDeviceStringEXT_ =
+        reinterpret_cast<PFNEGLQUERYDEVICESTRINGEXTPROC>(
+            eglGetProcAddress("eglQueryDeviceStringEXT"));
+    if (eglQueryDisplayAttribEXT_ && eglQueryDeviceStringEXT_) {
+        EGLAttrib dev_attr = 0;
+        if (eglQueryDisplayAttribEXT_(gl.display, EGL_DEVICE_EXT, &dev_attr)
+            && dev_attr) {
+            EGLDeviceEXT dev = reinterpret_cast<EGLDeviceEXT>(dev_attr);
+            node = eglQueryDeviceStringEXT_(dev, EGL_DRM_RENDER_NODE_FILE_EXT);
+            if (!node)
+                node = eglQueryDeviceStringEXT_(dev, EGL_DRM_DEVICE_FILE_EXT);
         }
     }
-    if (gl.drm_fd < 0) die("no /dev/dri/renderD* could be opened");
+    if (node) {
+        gl.drm_fd = ::open(node, O_RDWR | O_CLOEXEC);
+        if (gl.drm_fd < 0) {
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: EGL reported %s but open() failed: %s; scanning\n",
+                node, std::strerror(errno));
+        } else {
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: opened DRM render node %s via EGL_DEVICE_EXT (fd=%d)\n",
+                node, gl.drm_fd);
+        }
+    }
+    if (gl.drm_fd < 0) {
+        const char* scan[] = {
+            "/dev/dri/renderD128",
+            "/dev/dri/renderD129",
+        };
+        for (const char* n : scan) {
+            int fd = ::open(n, O_RDWR | O_CLOEXEC);
+            if (fd >= 0) {
+                gl.drm_fd = fd;
+                std::fprintf(stderr,
+                    "waywallen-mpv-renderer: opened DRM render node %s by scan (fd=%d)\n",
+                    n, fd);
+                break;
+            }
+        }
+    }
+    if (gl.drm_fd < 0) die("no DRM render node could be opened");
     gl.gbm = gbm_create_device(gl.drm_fd);
     if (!gl.gbm) die("gbm_create_device failed");
 }
 
-void init_egl(GlCtx& gl, const Options& opt) {
-    open_render_node(gl);
+void pick_export_format(GlCtx& gl, const Options& opt);
+void init_slots(GlCtx& gl, const Options& opt);
+bool try_legacy_linear(GlCtx& gl, const Options& opt, uint32_t fourcc);
 
+void init_egl(GlCtx& gl, const Options& opt) {
     gl.fns.eglGetPlatformDisplayEXT =
         reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
             must_egl_proc("eglGetPlatformDisplayEXT"));
@@ -193,6 +259,10 @@ void init_egl(GlCtx& gl, const Options& opt) {
         || !egl_has_ext(exts, "EGL_ANDROID_native_fence_sync"))
         die("EGL fence-sync extensions missing");
 
+    // Now that the display is initialized, open the DRM render node it's
+    // bound to (libfunnel-style) and create the matching GBM device.
+    open_render_node(gl);
+
     if (!eglBindAPI(EGL_OPENGL_ES_API)) die("eglBindAPI(GLES) failed");
 
     EGLint config_attrs[] = {
@@ -218,6 +288,27 @@ void init_egl(GlCtx& gl, const Options& opt) {
     if (!eglMakeCurrent(gl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, gl.context))
         die("eglMakeCurrent(surfaceless) failed");
 
+    auto str_or = [](const char* s) { return s ? s : "(null)"; };
+    auto gl_str = [&](GLenum name) {
+        return str_or(reinterpret_cast<const char*>(glGetString(name)));
+    };
+    std::fprintf(stderr,
+        "waywallen-mpv-renderer: GPU info\n"
+        "  egl vendor:  %s\n"
+        "  egl version: %s (%d.%d)\n"
+        "  egl client:  %s\n"
+        "  gl vendor:   %s\n"
+        "  gl renderer: %s\n"
+        "  gl version:  %s\n"
+        "  glsl ver:    %s\n",
+        str_or(eglQueryString(gl.display, EGL_VENDOR)),
+        str_or(eglQueryString(gl.display, EGL_VERSION)), major, minor,
+        str_or(eglQueryString(gl.display, EGL_CLIENT_APIS)),
+        gl_str(GL_VENDOR),
+        gl_str(GL_RENDERER),
+        gl_str(GL_VERSION),
+        gl_str(GL_SHADING_LANGUAGE_VERSION));
+
     gl.fns.eglCreateImageKHR =
         reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
             must_egl_proc("eglCreateImageKHR"));
@@ -233,6 +324,9 @@ void init_egl(GlCtx& gl, const Options& opt) {
     gl.fns.eglDupNativeFenceFDANDROID =
         reinterpret_cast<PFNEGLDUPNATIVEFENCEFDANDROIDPROC>(
             must_egl_proc("eglDupNativeFenceFDANDROID"));
+    gl.fns.eglQueryDmaBufModifiersEXT =
+        reinterpret_cast<PFNEGLQUERYDMABUFMODIFIERSEXTPROC>(
+            must_egl_proc("eglQueryDmaBufModifiersEXT"));
     // GL_OES_EGL_image: required to wrap an EGLImage as a GL_TEXTURE_2D.
     const GLubyte* gl_exts = glGetString(GL_EXTENSIONS);
     if (!gl_exts
@@ -244,62 +338,322 @@ void init_egl(GlCtx& gl, const Options& opt) {
         reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
             must_egl_proc("glEGLImageTargetTexture2DOES"));
 
-    // Allocate each slot as a LINEAR DMA-BUF via GBM, import as EGLImage
-    // with an explicit modifier, then wrap as GL_TEXTURE_2D + FBO. This
-    // avoids EGL_MESA_image_dma_buf_export's "modifier=INVALID" pitfall
-    // where the producer can't tell the consumer the true tiling.
-    const uint64_t linear_mods[] = { DRM_FORMAT_MOD_LINEAR };
+    pick_export_format(gl, opt);
+    init_slots(gl, opt);
+}
+
+const char* fourcc_name(uint32_t f) {
+    switch (f) {
+        case DRM_FORMAT_ABGR8888: return "ABGR8888";
+        case DRM_FORMAT_XBGR8888: return "XBGR8888";
+        case DRM_FORMAT_ARGB8888: return "ARGB8888";
+        case DRM_FORMAT_XRGB8888: return "XRGB8888";
+        case DRM_FORMAT_RGBA8888: return "RGBA8888";
+        case DRM_FORMAT_BGRA8888: return "BGRA8888";
+        case DRM_FORMAT_RGBX8888: return "RGBX8888";
+        case DRM_FORMAT_BGRX8888: return "BGRX8888";
+        default:                  return "?";
+    }
+}
+
+// Pick a (fourcc, modifier) pair that satisfies BOTH:
+//   1) EGL can import it as a non-external GL_TEXTURE_2D
+//      (i.e. eglQueryDmaBufModifiersEXT external_only == EGL_FALSE), AND
+//   2) GBM can produce it with GBM_BO_USE_RENDERING.
+//
+// (1) and (2) are not the same set — EGL's importer accepts vendor tilings
+// the GBM allocator's producer path won't actually emit. So we hand the
+// full filtered set to gbm_bo_create_with_modifiers2 and let the allocator
+// pick a modifier from the intersection. The actual modifier chosen is
+// pinned and reused for every slot to keep the BindBuffers metadata stable.
+void pick_export_format(GlCtx& gl, const Options& opt) {
+    // Mirrors libfunnel/src/egl.c: alpha + alpha-less, both byte orders.
+    const uint32_t cands[] = {
+        DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888,
+        DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
+        DRM_FORMAT_RGBX8888, DRM_FORMAT_BGRX8888,
+    };
+    for (uint32_t fourcc : cands) {
+        EGLint count = 0;
+        if (!gl.fns.eglQueryDmaBufModifiersEXT(
+                gl.display, static_cast<EGLint>(fourcc),
+                0, nullptr, nullptr, &count) || count <= 0) {
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: %s: no modifiers reported by EGL\n",
+                fourcc_name(fourcc));
+            continue;
+        }
+        std::vector<EGLuint64KHR> mods(static_cast<size_t>(count));
+        std::vector<EGLBoolean>   ext_only(static_cast<size_t>(count));
+        if (!gl.fns.eglQueryDmaBufModifiersEXT(
+                gl.display, static_cast<EGLint>(fourcc), count,
+                mods.data(), ext_only.data(), &count)) {
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: %s: eglQueryDmaBufModifiersEXT failed\n",
+                fourcc_name(fourcc));
+            continue;
+        }
+        std::fprintf(stderr,
+            "waywallen-mpv-renderer: %s: %d modifiers reported by EGL\n",
+            fourcc_name(fourcc), count);
+        for (int i = 0; i < count; ++i) {
+            std::fprintf(stderr, "  - 0x%016llx [external_only=%d]\n",
+                static_cast<unsigned long long>(mods[i]),
+                static_cast<int>(ext_only[i]));
+        }
+        std::vector<uint64_t> usable;
+        usable.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            if (!ext_only[i]) usable.push_back(static_cast<uint64_t>(mods[i]));
+        }
+        if (usable.empty()) {
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: %s: all %d modifiers are external_only\n",
+                fourcc_name(fourcc), count);
+            continue;
+        }
+        // Float LINEAR to the front so GBM prefers it when allocator-feasible.
+        for (size_t i = 0; i < usable.size(); ++i) {
+            if (usable[i] == DRM_FORMAT_MOD_LINEAR) {
+                std::swap(usable[0], usable[i]);
+                break;
+            }
+        }
+        // Probe-allocate one BO. GBM internally picks a modifier from the
+        // offered list that its producer side can actually produce. If it
+        // returns nullptr for the whole list, GBM and EGL disagree on this
+        // fourcc — try the next.
+        gbm_bo* probe = gbm_bo_create_with_modifiers2(
+            gl.gbm, opt.width, opt.height, fourcc,
+            usable.data(), usable.size(), GBM_BO_USE_RENDERING);
+        if (!probe) {
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: %s: gbm rejected all %zu non-external modifiers\n",
+                fourcc_name(fourcc), usable.size());
+            continue;
+        }
+        gl.export_fourcc           = fourcc;
+        gl.export_modifier         = gbm_bo_get_modifier(probe);
+        gl.use_explicit_modifier   = true;
+        std::fprintf(stderr,
+            "waywallen-mpv-renderer: chose export fourcc=%s modifier=0x%016llx "
+            "(probed from %zu non-external candidates)\n",
+            fourcc_name(fourcc),
+            static_cast<unsigned long long>(gl.export_modifier), usable.size());
+        gbm_bo_destroy(probe);
+        return;
+    }
+
+    // NVIDIA-style fallback. EGL listed many tiled modifiers it accepts
+    // (vendor=0x03), but NVIDIA's GBM only allocates LINEAR, and LINEAR
+    // is external_only on the modifier-tagged path — so the intersection
+    // above is empty. Legacy import (no modifier attrs) on top of an
+    // implicit-LINEAR BO is NVIDIA's standard EGL/GBM interop recipe and
+    // typically yields a TEXTURE_2D-bindable image.
+    std::fprintf(stderr,
+        "waywallen-mpv-renderer: modifier-aware probe failed, "
+        "falling back to legacy implicit-modifier LINEAR import\n");
+    const uint32_t legacy_cands[] = {
+        DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888,
+        DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
+        DRM_FORMAT_RGBX8888, DRM_FORMAT_BGRX8888,
+    };
+    for (uint32_t fourcc : legacy_cands) {
+        if (try_legacy_linear(gl, opt, fourcc)) {
+            gl.export_fourcc         = fourcc;
+            gl.use_explicit_modifier = false;
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: chose export fourcc=%s "
+                "via legacy LINEAR (modifier=0x%016llx, no modifier attrs on import)\n",
+                fourcc_name(fourcc),
+                static_cast<unsigned long long>(gl.export_modifier));
+            return;
+        }
+    }
+    die("no DMA-BUF (fourcc, modifier) supports both EGL import and GBM render-allocation");
+}
+
+// Legacy probe: allocate one LINEAR BO without modifier negotiation,
+// import via EGL_LINUX_DMA_BUF_EXT with no EGL_DMA_BUF_PLANE0_MODIFIER_*
+// attributes, and verify the result can be bound as GL_TEXTURE_2D and
+// used as a color attachment. On success, leaves gl.export_modifier set
+// to whatever GBM reports for the BO (LINEAR or INVALID, depending on
+// driver) so send_bind passes a faithful value to the daemon.
+bool try_legacy_linear(GlCtx& gl, const Options& opt, uint32_t fourcc) {
+    gbm_bo* bo = gbm_bo_create(
+        gl.gbm, opt.width, opt.height, fourcc,
+        GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+    if (!bo) {
+        std::fprintf(stderr,
+            "waywallen-mpv-renderer: %s: legacy gbm_bo_create(USE_LINEAR) failed\n",
+            fourcc_name(fourcc));
+        return false;
+    }
+    int      dmabuf_fd = gbm_bo_get_fd(bo);
+    uint32_t stride    = gbm_bo_get_stride(bo);
+    uint32_t offset    = gbm_bo_get_offset(bo, 0);
+    uint64_t modifier  = gbm_bo_get_modifier(bo);
+    if (dmabuf_fd < 0) {
+        gbm_bo_destroy(bo);
+        return false;
+    }
+
+    EGLint attrs[] = {
+        EGL_WIDTH,                     static_cast<EGLint>(opt.width),
+        EGL_HEIGHT,                    static_cast<EGLint>(opt.height),
+        EGL_LINUX_DRM_FOURCC_EXT,      static_cast<EGLint>(fourcc),
+        EGL_DMA_BUF_PLANE0_FD_EXT,     dmabuf_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(offset),
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,  static_cast<EGLint>(stride),
+        EGL_NONE,
+    };
+    EGLImageKHR img = gl.fns.eglCreateImageKHR(
+        gl.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
+    bool ok = false;
+    if (img == EGL_NO_IMAGE_KHR) {
+        std::fprintf(stderr,
+            "waywallen-mpv-renderer: %s: legacy eglCreateImageKHR failed (egl_err=0x%04x)\n",
+            fourcc_name(fourcc), eglGetError());
+    } else {
+        GLuint tex = 0, fbo = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        (void)glGetError();
+        gl.fns.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
+        GLenum bind_err = glGetError();
+        if (bind_err != GL_NO_ERROR) {
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: %s: legacy bind to TEXTURE_2D rejected "
+                "(gl_err=0x%04x — likely external_only)\n",
+                fourcc_name(fourcc), bind_err);
+        } else {
+            glGenFramebuffers(1, &fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, tex, 0);
+            GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if (st == GL_FRAMEBUFFER_COMPLETE) {
+                ok = true;
+                gl.export_modifier = modifier;
+            } else {
+                std::fprintf(stderr,
+                    "waywallen-mpv-renderer: %s: legacy FBO incomplete (status=0x%04x)\n",
+                    fourcc_name(fourcc), st);
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+        if (fbo) glDeleteFramebuffers(1, &fbo);
+        glDeleteTextures(1, &tex);
+        gl.fns.eglDestroyImageKHR(gl.display, img);
+    }
+    close(dmabuf_fd);
+    gbm_bo_destroy(bo);
+    return ok;
+}
+
+void init_slots(GlCtx& gl, const Options& opt) {
+    const uint64_t mods[1] = { gl.export_modifier };
     for (uint32_t i = 0; i < SLOT_COUNT; ++i) {
         Slot& s = gl.slots[i];
 
-        s.bo = gbm_bo_create_with_modifiers2(
-            gl.gbm, opt.width, opt.height, GBM_FORMAT_ABGR8888,
-            linear_mods, 1, GBM_BO_USE_RENDERING);
-        if (!s.bo) die("gbm_bo_create_with_modifiers2(LINEAR) failed");
+        // 1) mpv intermediate target: ordinary GL_RGBA8 texture + FBO.
+        //    No DMA-BUF involvement here, so this can never fail for
+        //    driver-specific external_only / modifier reasons.
+        glGenTextures(1, &s.mpv_texture);
+        glBindTexture(GL_TEXTURE_2D, s.mpv_texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                     static_cast<GLsizei>(opt.width),
+                     static_cast<GLsizei>(opt.height),
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        glGenFramebuffers(1, &s.mpv_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, s.mpv_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, s.mpv_texture, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            die("mpv intermediate FBO incomplete");
+
+        // 2) Export DMA-BUF, allocated and imported per the strategy
+        //    pick_export_format settled on.
+        if (gl.use_explicit_modifier) {
+            s.bo = gbm_bo_create_with_modifiers2(
+                gl.gbm, opt.width, opt.height, gl.export_fourcc,
+                mods, 1, GBM_BO_USE_RENDERING);
+            if (!s.bo) die("gbm_bo_create_with_modifiers2 failed");
+        } else {
+            s.bo = gbm_bo_create(
+                gl.gbm, opt.width, opt.height, gl.export_fourcc,
+                GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+            if (!s.bo) die("gbm_bo_create(USE_LINEAR) failed");
+        }
 
         s.dmabuf_fd    = gbm_bo_get_fd(s.bo);
         if (s.dmabuf_fd < 0) die("gbm_bo_get_fd failed");
         s.stride       = gbm_bo_get_stride(s.bo);
         s.offset       = gbm_bo_get_offset(s.bo, 0);
         s.drm_modifier = gbm_bo_get_modifier(s.bo);
-        // Conservative byte count, used only by the daemon for accounting.
         s.size         = s.stride * opt.height;
 
-        const EGLint mod_lo = static_cast<EGLint>(
-            s.drm_modifier & 0xffffffffULL);
-        const EGLint mod_hi = static_cast<EGLint>(
-            (s.drm_modifier >> 32) & 0xffffffffULL);
-        EGLint attrs[] = {
+        EGLint attrs_modifier[] = {
             EGL_WIDTH,                          static_cast<EGLint>(opt.width),
             EGL_HEIGHT,                         static_cast<EGLint>(opt.height),
-            EGL_LINUX_DRM_FOURCC_EXT,           static_cast<EGLint>(DRM_FORMAT_ABGR8888),
+            EGL_LINUX_DRM_FOURCC_EXT,           static_cast<EGLint>(gl.export_fourcc),
             EGL_DMA_BUF_PLANE0_FD_EXT,          s.dmabuf_fd,
             EGL_DMA_BUF_PLANE0_OFFSET_EXT,      static_cast<EGLint>(s.offset),
             EGL_DMA_BUF_PLANE0_PITCH_EXT,       static_cast<EGLint>(s.stride),
-            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, mod_lo,
-            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, mod_hi,
+            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                static_cast<EGLint>(s.drm_modifier & 0xffffffffULL),
+            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                static_cast<EGLint>((s.drm_modifier >> 32) & 0xffffffffULL),
+            EGL_NONE,
+        };
+        EGLint attrs_legacy[] = {
+            EGL_WIDTH,                     static_cast<EGLint>(opt.width),
+            EGL_HEIGHT,                    static_cast<EGLint>(opt.height),
+            EGL_LINUX_DRM_FOURCC_EXT,      static_cast<EGLint>(gl.export_fourcc),
+            EGL_DMA_BUF_PLANE0_FD_EXT,     s.dmabuf_fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(s.offset),
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,  static_cast<EGLint>(s.stride),
             EGL_NONE,
         };
         s.egl_image = gl.fns.eglCreateImageKHR(
-            gl.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
-            nullptr, attrs);
+            gl.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr,
+            gl.use_explicit_modifier ? attrs_modifier : attrs_legacy);
         if (s.egl_image == EGL_NO_IMAGE_KHR)
             die("eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT) failed");
 
-        glGenTextures(1, &s.texture);
-        glBindTexture(GL_TEXTURE_2D, s.texture);
+        glGenTextures(1, &s.export_texture);
+        glBindTexture(GL_TEXTURE_2D, s.export_texture);
+        (void)glGetError(); // clear pending errors
         gl.fns.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, s.egl_image);
+        GLenum gl_err_after_image = glGetError();
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        glGenFramebuffers(1, &s.fbo);
-        glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
+        glGenFramebuffers(1, &s.export_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, s.export_fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, s.texture, 0);
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-            die("slot FBO incomplete");
+                               GL_TEXTURE_2D, s.export_texture, 0);
+        GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (fbo_status != GL_FRAMEBUFFER_COMPLETE) {
+            std::fprintf(stderr,
+                "waywallen-mpv-renderer: slot[%u] export FBO incomplete: "
+                "status=0x%04x gl_err_after_image=0x%04x gl_err_now=0x%04x "
+                "size=%ux%u stride=%u offset=%u modifier=0x%016llx fourcc=%s fd=%d\n",
+                i, fbo_status, gl_err_after_image, glGetError(),
+                opt.width, opt.height, s.stride, s.offset,
+                static_cast<unsigned long long>(s.drm_modifier),
+                fourcc_name(gl.export_fourcc), s.dmabuf_fd);
+            die("export FBO incomplete");
+        }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 }
@@ -322,8 +676,10 @@ void destroy_gl(GlCtx& gl) {
         for (auto& s : gl.slots) {
             if (s.egl_image != EGL_NO_IMAGE_KHR)
                 gl.fns.eglDestroyImageKHR(gl.display, s.egl_image);
-            if (s.fbo)     glDeleteFramebuffers(1, &s.fbo);
-            if (s.texture) glDeleteTextures(1, &s.texture);
+            if (s.export_fbo)     glDeleteFramebuffers(1, &s.export_fbo);
+            if (s.export_texture) glDeleteTextures(1, &s.export_texture);
+            if (s.mpv_fbo)        glDeleteFramebuffers(1, &s.mpv_fbo);
+            if (s.mpv_texture)    glDeleteTextures(1, &s.mpv_texture);
             if (s.dmabuf_fd >= 0) close(s.dmabuf_fd);
             if (s.bo) gbm_bo_destroy(s.bo);
         }
@@ -414,23 +770,34 @@ void mpv_init(MpvState& m, const Options& opt, WakeState& wake) {
 
 bool mpv_render_into_slot(MpvState& m, GlCtx& gl, uint32_t slot,
                           const Options& opt) {
+    // Pass 1: mpv renders into a native GL_RGBA8 intermediate FBO.
     mpv_opengl_fbo fbo_info {};
-    fbo_info.fbo             = static_cast<int>(gl.slots[slot].fbo);
+    fbo_info.fbo             = static_cast<int>(gl.slots[slot].mpv_fbo);
     fbo_info.w               = static_cast<int>(opt.width);
     fbo_info.h               = static_cast<int>(opt.height);
     fbo_info.internal_format = 0;
 
-    // DMA-BUF rows are stored top-to-bottom (DRM convention). A GL FBO
-    // backed by a DMA-BUF-imported texture therefore maps window
-    // coordinate y=0 to DMA-BUF row 0 already — no extra flip needed
-    // on mpv's side. (The old export path used the opposite convention.)
+    // FLIP_Y=0 is GL convention (y=0 at bottom). The blit below copies
+    // src y -> dst y unchanged, so the DMA-BUF FBO ends up byte-equivalent
+    // to the previous direct-render path which also used FLIP_Y=0.
     int flip_y = 0;
     mpv_render_param params[] = {
         { MPV_RENDER_PARAM_OPENGL_FBO, &fbo_info },
         { MPV_RENDER_PARAM_FLIP_Y,     &flip_y },
         { MPV_RENDER_PARAM_INVALID,    nullptr },
     };
-    return mpv_render_context_render(m.ctx, params) >= 0;
+    if (mpv_render_context_render(m.ctx, params) < 0) return false;
+
+    // Pass 2: blit the intermediate into the DMA-BUF-backed export FBO.
+    // Same dimensions and channel-compatible formats ⇒ a single GPU copy.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gl.slots[slot].mpv_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gl.slots[slot].export_fbo);
+    glBlitFramebuffer(
+        0, 0, static_cast<GLint>(opt.width), static_cast<GLint>(opt.height),
+        0, 0, static_cast<GLint>(opt.width), static_cast<GLint>(opt.height),
+        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return true;
 }
 
 void mpv_drain_events(MpvState& m, std::atomic<bool>& shutdown) {
@@ -510,7 +877,7 @@ void send_bind(HostState& s, const Options& opt, GlCtx& gl) {
     bb.generation   = s.bind_generation;
     bb.flags        = s.flags;
     bb.count        = SLOT_COUNT;
-    bb.fourcc       = DRM_FORMAT_ABGR8888;
+    bb.fourcc       = gl.export_fourcc;
     bb.width        = opt.width;
     bb.height       = opt.height;
     bb.stride       = gl.slots[0].stride;
@@ -602,7 +969,8 @@ struct WwDrmSyncobjTimelineWait {
     _IOWR(DRM_IOCTL_BASE, 0xC1, WwDrmSyncobjHandle)
 #define WW_DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT \
     _IOWR(DRM_IOCTL_BASE, 0xCA, WwDrmSyncobjTimelineWait)
-#define WW_DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL (1u << 0)
+#define WW_DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL        (1u << 0)
+#define WW_DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT (1u << 1)
 
 // Create a fresh drm_syncobj on `drm_fd` and ship its OPAQUE_FD
 // export over the bridge as a `ReleaseSyncobj` event. Caches the
@@ -669,7 +1037,12 @@ bool wait_release_point(int drm_fd, uint32_t handle, uint64_t point,
     arg.points        = reinterpret_cast<uintptr_t>(points);
     arg.timeout_nsec  = deadline;
     arg.count_handles = 1;
-    arg.flags         = WW_DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
+    // WAIT_FOR_SUBMIT lets us wait on a timeline `point` whose fence
+    // hasn't been TRANSFERed in yet (the daemon's reaper races with the
+    // renderer's next-frame back-pressure check). Without it the kernel
+    // returns EINVAL immediately for any not-yet-materialized point.
+    arg.flags         = WW_DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+                      | WW_DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
 
     if (::ioctl(drm_fd, WW_DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &arg) != 0) {
         // ETIME = compositor still using buffer; we run ahead anyway

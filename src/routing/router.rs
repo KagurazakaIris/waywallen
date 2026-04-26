@@ -811,6 +811,19 @@ impl Router {
             .collect();
         let expected_count = recipients.len() as u32;
         if expected_count == 0 {
+            // No enabled recipients: still hand the producer's release
+            // timeline a synthetic signal at this point so its
+            // back-pressure wait doesn't time out forever.
+            if let Err(e) = renderer.submit_frame_record(crate::sync::FrameRecord {
+                release_point,
+                consumer_handle: None,
+                expected_count: 0,
+            }) {
+                log::warn!(
+                    "router: renderer {renderer_id}: failed to enqueue \
+                     advance-only FrameRecord (point {release_point}): {e}"
+                );
+            }
             return;
         }
         for state in recipients {
@@ -927,14 +940,25 @@ impl Router {
             out
         };
         for (rid, flags) in actions {
+            // ConfigureBuffers dispatch is PAUSED while the release_syncobj
+            // plumbing is being shaken out — re-binding mid-stream throws
+            // off the per-frame syncobj bookkeeping (each new generation
+            // resets pending_release_fds and the producer's
+            // last_release_point, exposing edge-case races between
+            // rebuild → re-emit bind_buffers → first frame_ready of the
+            // new generation). Log what we would have sent so the
+            // routing decision is still visible. Re-enable by restoring
+            // the `send_configure_buffers` call below.
             log::info!(
-                "router: renderer {rid} buffer_flags transition → 0x{flags:x}"
+                "router: renderer {rid} buffer_flags transition → 0x{flags:x} \
+                 (PAUSED — dispatch suppressed)"
             );
-            if let Err(e) = self.mgr.send_configure_buffers(&rid, flags).await {
-                log::warn!(
-                    "router: configure_buffers {rid} flags=0x{flags:x}: {e}"
-                );
-            }
+            // if let Err(e) = self.mgr.send_configure_buffers(&rid, flags).await {
+            //     log::warn!(
+            //         "router: configure_buffers {rid} flags=0x{flags:x}: {e}"
+            //     );
+            // }
+            let _ = (&self.mgr, flags);
         }
     }
 

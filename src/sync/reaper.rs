@@ -60,9 +60,18 @@ const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 /// and consumed by [`spawn_reaper`].
 pub struct FrameRecord {
     pub release_point: u64,
-    pub consumer_handle: SyncobjHandle,
+    /// `None` means the router had zero enabled recipients for this
+    /// frame (e.g. paused renderer, no displays linked). The reaper
+    /// still has to advance the producer's release timeline at
+    /// `release_point` — otherwise the producer's back-pressure
+    /// `wait_release_point` will time out forever once it cycles back
+    /// to this slot. With `None`, the reaper allocates a fresh
+    /// already-signaled binary syncobj and TRANSFERs it onto the
+    /// producer timeline directly, bypassing the bucket flow.
+    pub consumer_handle: Option<SyncobjHandle>,
     /// Total fan-out width — how many records the reaper should expect
-    /// to see with this `release_point` before flushing.
+    /// to see with this `release_point` before flushing. `0` is only
+    /// valid alongside `consumer_handle == None`.
     pub expected_count: u32,
 }
 
@@ -99,6 +108,17 @@ pub fn spawn_reaper(
                         log::info!("reaper {renderer_id}: channel closed, exiting");
                         return;
                     };
+                    let Some(consumer_handle) = record.consumer_handle else {
+                        // No real recipients (paused / no enabled outputs).
+                        // Advance the producer's release timeline directly
+                        // so its back-pressure wait at this point doesn't
+                        // hang forever.
+                        advance_release_point(
+                            drm, &renderer, &mut producer_handle,
+                            record.release_point,
+                        ).await;
+                        continue;
+                    };
                     let entry = buckets.entry(record.release_point).or_insert_with(|| {
                         Bucket {
                             handles: Vec::new(),
@@ -112,7 +132,7 @@ pub fn spawn_reaper(
                     // longer rather than flushing prematurely on an
                     // off-by-one race in the router.
                     entry.expected = entry.expected.max(record.expected_count);
-                    entry.handles.push(record.consumer_handle);
+                    entry.handles.push(consumer_handle);
                     if entry.handles.len() as u32 >= entry.expected {
                         let bucket = buckets.remove(&record.release_point).unwrap();
                         flush_bucket(drm, &renderer, &mut producer_handle, record.release_point, bucket).await;
@@ -153,6 +173,84 @@ async fn sleep_until_or_pending(deadline: Option<Instant>) {
     }
 }
 
+/// Lazy-import the producer's release_syncobj into our handle cache.
+/// Returns true if `producer_handle` is `Some` after this call.
+fn ensure_producer_handle(
+    drm: &'static DrmDevice,
+    renderer: &Arc<RendererHandle>,
+    producer_handle: &mut Option<SyncobjHandle>,
+    release_point: u64,
+) -> bool {
+    if producer_handle.is_some() {
+        return true;
+    }
+    let Some(fd) = renderer.clone_release_syncobj_fd() else {
+        log::warn!(
+            "reaper {}: dropping point {release_point} — \
+             producer hasn't sent ReleaseSyncobj yet",
+            renderer.id
+        );
+        return false;
+    };
+    match drm.fd_to_handle(&fd) {
+        Ok(h) => {
+            *producer_handle = Some(h);
+            log::info!("reaper {}: imported release_syncobj", renderer.id);
+            true
+        }
+        Err(e) => {
+            log::warn!(
+                "reaper {}: DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE failed: {e}",
+                renderer.id
+            );
+            false
+        }
+    }
+}
+
+/// Used when the router has zero recipients for a frame: allocate a
+/// fresh binary syncobj, force-SIGNAL it, and TRANSFER it onto the
+/// producer's release timeline at `release_point`. The producer's
+/// next back-pressure wait at this point therefore returns
+/// immediately rather than timing out.
+async fn advance_release_point(
+    drm: &'static DrmDevice,
+    renderer: &Arc<RendererHandle>,
+    producer_handle: &mut Option<SyncobjHandle>,
+    release_point: u64,
+) {
+    if !ensure_producer_handle(drm, renderer, producer_handle, release_point) {
+        return;
+    }
+    let producer = producer_handle.as_ref().expect("set above");
+
+    let placeholder = match drm.create_binary_syncobj() {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!(
+                "reaper {}: advance point {release_point}: create_binary_syncobj: {e}",
+                renderer.id
+            );
+            return;
+        }
+    };
+    if let Err(e) = drm.signal(&placeholder) {
+        log::warn!(
+            "reaper {}: advance point {release_point}: SIGNAL: {e}",
+            renderer.id
+        );
+        return;
+    }
+    if let Err(e) = drm.transfer(&placeholder, 0, producer, release_point) {
+        log::warn!(
+            "reaper {}: advance point {release_point}: TRANSFER: {e}",
+            renderer.id
+        );
+    }
+    // `placeholder` drops here → DESTROY ioctl. Producer timeline
+    // already holds the signaled fence via TRANSFER, so this is safe.
+}
+
 /// Wait for every handle in `bucket` to signal (force-SIGNAL stragglers
 /// after `WAIT_TIMEOUT`), then TRANSFER one of them onto the producer's
 /// release timeline at `release_point`. Imports the producer timeline
@@ -168,34 +266,8 @@ async fn flush_bucket(
         return;
     }
 
-    // Lazy import producer's release timeline. Without it we cannot
-    // TRANSFER, so just drop the handles (refcount → DESTROY) and
-    // log. Producer wait at this release_point will deadlock — that
-    // is the same outcome as before iter D2; we surface a warn so
-    // it's debuggable.
-    if producer_handle.is_none() {
-        if let Some(fd) = renderer.clone_release_syncobj_fd() {
-            match drm.fd_to_handle(&fd) {
-                Ok(h) => {
-                    *producer_handle = Some(h);
-                    log::info!("reaper {}: imported release_syncobj", renderer.id);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "reaper {}: DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE failed: {e}",
-                        renderer.id
-                    );
-                    return;
-                }
-            }
-        } else {
-            log::warn!(
-                "reaper {}: dropping bucket at point {release_point} — \
-                 producer hasn't sent ReleaseSyncobj yet",
-                renderer.id
-            );
-            return;
-        }
+    if !ensure_producer_handle(drm, renderer, producer_handle, release_point) {
+        return;
     }
     let producer = producer_handle.as_ref().expect("set above");
 

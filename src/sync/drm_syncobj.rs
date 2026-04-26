@@ -243,11 +243,18 @@ impl DrmDevice {
             return Ok(());
         }
         let mut raw: Vec<u32> = handles.iter().map(|h| h.handle).collect();
+        // WAIT_FOR_SUBMIT is mandatory here: the reaper waits on freshly
+        // created consumer binary syncobjs whose kernel fence is NULL until
+        // the consumer's GPU work runs and IMPORT_SYNC_FILEs a fence in.
+        // Without this flag the kernel rejects a NULL-fence wait with
+        // EINVAL immediately instead of blocking until the fence appears
+        // (or until our absolute CLOCK_MONOTONIC `timeout_nsec` lapses).
         let mut arg = DrmSyncobjWait {
             handles: raw.as_mut_ptr() as u64,
             timeout_nsec,
             count_handles: raw.len() as u32,
-            flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+            flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+                | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
             first_signaled: 0,
             pad: 0,
         };
