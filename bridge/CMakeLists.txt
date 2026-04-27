@@ -13,7 +13,10 @@ option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
 
 add_library(waywallen-bridge
     src/bridge.c
+    src/drm_fourcc.c
     src/ipc_v1.c
+    src/probe_egl.c
+    src/probe_vk.c
 )
 add_library(waywallen::bridge ALIAS waywallen-bridge)
 
@@ -21,6 +24,20 @@ target_include_directories(waywallen-bridge
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+)
+
+# EGL and Vulkan *headers only* — bridge declares dispatch-table types
+# from <EGL/egl.h>, <EGL/eglext.h>, <vulkan/vulkan.h> but resolves
+# every entry point at runtime via plugin-supplied `get_proc_addr`
+# callbacks. We deliberately do NOT link libEGL or libvulkan so the
+# bridge stays backend-agnostic; renderer plugins choose vk/egl at
+# init time and pass their own loader.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(WW_BRIDGE_EGL REQUIRED egl)
+find_package(Vulkan REQUIRED)
+target_include_directories(waywallen-bridge SYSTEM PRIVATE
+    ${WW_BRIDGE_EGL_INCLUDE_DIRS}
+    ${Vulkan_INCLUDE_DIRS}
 )
 
 target_compile_features(waywallen-bridge PUBLIC c_std_99)

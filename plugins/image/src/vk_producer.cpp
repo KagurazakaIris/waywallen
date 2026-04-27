@@ -5,15 +5,11 @@
 #include <unistd.h>
 #include <vector>
 
+#include <waywallen-bridge/drm_fourcc.h>
+
 namespace ww_image {
 
 namespace {
-
-// DRM_FORMAT_ABGR8888 == fourcc('A','B','2','4'): memory order R,G,B,A, which
-// is what VK_FORMAT_R8G8B8A8_UNORM lays out, and what EGL consumers see when
-// they import this DMA-BUF.
-constexpr uint32_t DRM_FORMAT_ABGR8888 = 0x34324241u;
-constexpr uint64_t DRM_FORMAT_MOD_LINEAR = 0;
 
 bool fail(std::string* err, std::string msg) {
     if (err) *err = std::move(msg);
@@ -94,7 +90,7 @@ VkProducer::~VkProducer() {
 
 std::unique_ptr<VkProducer>
 VkProducer::create(uint32_t width, uint32_t height, uint32_t flags,
-                   std::string* err) {
+                   uint64_t modifier, std::string* err) {
     if (width == 0 || height == 0) {
         fail(err, "VkProducer: width/height must be non-zero");
         return nullptr;
@@ -102,6 +98,7 @@ VkProducer::create(uint32_t width, uint32_t height, uint32_t flags,
 
     auto self = std::unique_ptr<VkProducer>(new VkProducer());
     self->flags_ = flags;
+    self->modifier_ = modifier;
     self->layout_.width  = width;
     self->layout_.height = height;
 
@@ -383,16 +380,16 @@ VkProducer::create(uint32_t width, uint32_t height, uint32_t flags,
 
 
 bool VkProducer::build_image(std::string* err) {
-    // We pin modifier=LINEAR for now: trivially portable, every EGL/Vulkan
-    // consumer can import it, and the layout query returns a plain
-    // width*4-byte-row image. Note: LINEAR tiling only constrains the
-    // image's data layout — it does NOT pin the memory placement. The
-    // physical heap is dictated entirely by the memory-type index we
-    // pick below, so cross-GPU PRIME import requires WW_BUF_HOST_VISIBLE
-    // (true GTT, HOST_VISIBLE && !DEVICE_LOCAL) — DEVICE_LOCAL with
-    // LINEAR tiling still lives in VRAM and a foreign GPU cannot import
-    // it.
-    const uint64_t mods[] = { DRM_FORMAT_MOD_LINEAR };
+    // The image is allocated with the single DRM modifier the caller
+    // requested (`modifier_` — set by `create()` / `rebuild()`).
+    // Vulkan picks that modifier (it has nothing else to choose from)
+    // and the actual layout for that tiling is read back below from
+    // `vkGetImageDrmFormatModifierPropertiesEXT`. Note: tiling
+    // (modifier) only constrains the image's data layout — it does
+    // NOT pin the memory placement. The physical heap is dictated by
+    // the memory-type index picked below, so cross-GPU PRIME import
+    // requires WW_BUF_HOST_VISIBLE (true GTT) regardless of modifier.
+    const uint64_t mods[] = { modifier_ };
     VkImageDrmFormatModifierListCreateInfoEXT mod_list {};
     mod_list.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
     mod_list.drmFormatModifierCount = 1;
@@ -548,14 +545,14 @@ bool VkProducer::build_image(std::string* err) {
 
     layout_.dmabuf_fd    = fd;
     layout_.drm_modifier = mod_props.drmFormatModifier;
-    layout_.drm_fourcc   = DRM_FORMAT_ABGR8888;
+    layout_.drm_fourcc   = WW_DRM_FORMAT_ABGR8888;
     layout_.plane_offset = static_cast<uint32_t>(vk_layout.offset);
     layout_.stride       = static_cast<uint32_t>(vk_layout.rowPitch);
     layout_.size         = static_cast<uint32_t>(mr.memoryRequirements.size);
     return true;
 }
 
-bool VkProducer::rebuild(uint32_t flags, std::string* err) {
+bool VkProducer::rebuild(uint32_t flags, uint64_t modifier, std::string* err) {
     if (device_ == VK_NULL_HANDLE) {
         return fail(err, "rebuild on uninitialised producer"), false;
     }
@@ -573,6 +570,7 @@ bool VkProducer::rebuild(uint32_t flags, std::string* err) {
         layout_.dmabuf_fd = -1;
     }
     flags_ = flags;
+    modifier_ = modifier;
     return build_image(err);
 }
 
@@ -699,6 +697,85 @@ int VkProducer::upload_and_submit(const uint8_t* data, size_t size,
         return -1;
     }
     return sync_fd;
+}
+
+// Bit constants live in <waywallen-bridge/protocol_bits.h> (pulled
+// in via vk_producer.hpp). Format-feature → usage mapping stays
+// here since it's Vulkan-specific.
+namespace {
+uint32_t map_format_features_to_usage(VkFormatFeatureFlags ff) {
+    uint32_t u = 0;
+    if (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)        u |= WW_USAGE_SAMPLED;
+    if (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)        u |= WW_USAGE_STORAGE;
+    if (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)     u |= WW_USAGE_COLOR_ATTACHMENT;
+    if (ff & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)         u |= WW_USAGE_TRANSFER_SRC;
+    if (ff & VK_FORMAT_FEATURE_TRANSFER_DST_BIT)         u |= WW_USAGE_TRANSFER_DST;
+    return u;
+}
+} // namespace
+
+bool VkProducer::query_format_caps(VkFormatCaps* out, std::string* err) const {
+    if (!out) {
+        fail(err, "query_format_caps: out is null");
+        return false;
+    }
+    if (phys_ == VK_NULL_HANDLE || !vkGetPhysicalDeviceProperties2_) {
+        fail(err, "query_format_caps: producer not initialized");
+        return false;
+    }
+    out->fourccs.clear();
+    out->mod_counts.clear();
+    out->modifiers.clear();
+    out->usages.clear();
+    out->plane_counts.clear();
+    std::memset(out->device_uuid, 0, sizeof(out->device_uuid));
+    std::memset(out->driver_uuid, 0, sizeof(out->driver_uuid));
+    out->mem_hints = WW_MEM_HINT_DEVICE_LOCAL | WW_MEM_HINT_HOST_VISIBLE;
+
+    // --- Probe modifier list for ABGR8888 (VK_FORMAT_R8G8B8A8_UNORM)
+    auto vkGetPhysicalDeviceFormatProperties2_ =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
+            vkGetInstanceProcAddr(instance_, "vkGetPhysicalDeviceFormatProperties2"));
+    if (!vkGetPhysicalDeviceFormatProperties2_) {
+        fail(err, "query_format_caps: vkGetPhysicalDeviceFormatProperties2 missing");
+        return false;
+    }
+
+    VkDrmFormatModifierPropertiesListEXT mod_list {};
+    mod_list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
+    VkFormatProperties2 fp2 {};
+    fp2.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+    fp2.pNext = &mod_list;
+    // First call: count-only
+    vkGetPhysicalDeviceFormatProperties2_(phys_, VK_FORMAT_R8G8B8A8_UNORM, &fp2);
+    std::vector<VkDrmFormatModifierPropertiesEXT> probed(mod_list.drmFormatModifierCount);
+    mod_list.pDrmFormatModifierProperties = probed.data();
+    vkGetPhysicalDeviceFormatProperties2_(phys_, VK_FORMAT_R8G8B8A8_UNORM, &fp2);
+
+    if (probed.empty()) {
+        fail(err, "query_format_caps: driver reports zero modifiers for ABGR8888");
+        return false;
+    }
+
+    out->fourccs.push_back(WW_DRM_FORMAT_ABGR8888);
+    out->mod_counts.push_back(static_cast<uint32_t>(probed.size()));
+    for (auto& m : probed) {
+        out->modifiers.push_back(m.drmFormatModifier);
+        out->usages.push_back(map_format_features_to_usage(m.drmFormatModifierTilingFeatures));
+        out->plane_counts.push_back(m.drmFormatModifierPlaneCount);
+    }
+
+    // --- Pull device + driver UUID via VkPhysicalDeviceIDProperties (Vulkan 1.1 core)
+    VkPhysicalDeviceIDProperties id_props {};
+    id_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceProperties2 pd2 {};
+    pd2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    pd2.pNext = &id_props;
+    vkGetPhysicalDeviceProperties2_(phys_, &pd2);
+    std::memcpy(out->device_uuid, id_props.deviceUUID, 16);
+    std::memcpy(out->driver_uuid, id_props.driverUUID, 16);
+
+    return true;
 }
 
 int VkProducer::export_release_syncobj_fd(std::string* err) {

@@ -2,6 +2,7 @@
 // for the waywallen daemon. Spawned for wallpapers of type "video".
 
 #include <waywallen-bridge/bridge.h>
+#include <waywallen-bridge/probe_egl.h>
 
 #include <mpv/client.h>
 #include <mpv/render.h>
@@ -15,10 +16,6 @@
 #include <gbm.h>
 #include <fcntl.h>
 #include <errno.h>
-
-#ifndef DRM_FORMAT_MOD_LINEAR
-#define DRM_FORMAT_MOD_LINEAR 0ULL
-#endif
 
 #include <atomic>
 #include <chrono>
@@ -43,18 +40,11 @@
 namespace {
 
 constexpr uint32_t SLOT_COUNT          = 3;
-// DRM fourcc constants. ABGR8888 (memory order R,G,B,A) matches GL_RGBA8
-// channel layout on Mesa, but some drivers only accept other fourccs as
-// non-external GL_TEXTURE_2D bind targets — so we probe at runtime
+// DRM fourcc constants live in <waywallen-bridge/drm_fourcc.h> as
+// WW_DRM_FORMAT_*. ABGR8888 (memory order R,G,B,A) matches GL_RGBA8
+// channel layout on Mesa, but some drivers only accept other fourccs
+// as non-external GL_TEXTURE_2D bind targets — so we probe at runtime
 // across the full 8888 family (cf. libfunnel's egl.c try_format()).
-constexpr uint32_t DRM_FORMAT_ABGR8888 = 0x34324241u; // 'A','B','2','4'
-constexpr uint32_t DRM_FORMAT_XBGR8888 = 0x34324258u; // 'X','B','2','4'
-constexpr uint32_t DRM_FORMAT_ARGB8888 = 0x34325241u; // 'A','R','2','4'
-constexpr uint32_t DRM_FORMAT_XRGB8888 = 0x34325258u; // 'X','R','2','4'
-constexpr uint32_t DRM_FORMAT_RGBA8888 = 0x41424752u; // 'R','G','B','A'
-constexpr uint32_t DRM_FORMAT_BGRA8888 = 0x41524742u; // 'B','G','R','A'
-constexpr uint32_t DRM_FORMAT_RGBX8888 = 0x58424752u; // 'R','G','B','X'
-constexpr uint32_t DRM_FORMAT_BGRX8888 = 0x58524742u; // 'B','G','R','X'
 
 struct Options {
     std::string ipc_path;
@@ -158,6 +148,15 @@ struct GlCtx {
     // import without EGL modifier attrs. Used when EGL's importable
     // modifier set has no overlap with GBM's producible set.
     bool               use_explicit_modifier { true };
+    // Full set of modifiers the (EGL importer ∩ GBM producer) probe
+    // accepted for `export_fourcc`. Advertised to the daemon as
+    // `format_caps`; the picker may select any of these. The slots
+    // themselves are pinned to one modifier (`export_modifier`); if
+    // the daemon picks a different one, the renderer reports
+    // `bind_failed` and the daemon's iter-5 retry loop blacklists
+    // it and re-picks. Always contains `export_modifier`. For the
+    // legacy path it's just `{ DRM_FORMAT_MOD_LINEAR }`.
+    std::vector<uint64_t> usable_modifiers;
 };
 
 void* must_egl_proc(const char* name) {
@@ -227,6 +226,7 @@ void open_render_node(GlCtx& gl) {
 
 void pick_export_format(GlCtx& gl, const Options& opt);
 void init_slots(GlCtx& gl, const Options& opt);
+void release_slots(GlCtx& gl);
 bool try_legacy_linear(GlCtx& gl, const Options& opt, uint32_t fourcc);
 
 void init_egl(GlCtx& gl, const Options& opt) {
@@ -288,26 +288,13 @@ void init_egl(GlCtx& gl, const Options& opt) {
     if (!eglMakeCurrent(gl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, gl.context))
         die("eglMakeCurrent(surfaceless) failed");
 
-    auto str_or = [](const char* s) { return s ? s : "(null)"; };
-    auto gl_str = [&](GLenum name) {
-        return str_or(reinterpret_cast<const char*>(glGetString(name)));
-    };
-    std::fprintf(stderr,
-        "waywallen-mpv-renderer: GPU info\n"
-        "  egl vendor:  %s\n"
-        "  egl version: %s (%d.%d)\n"
-        "  egl client:  %s\n"
-        "  gl vendor:   %s\n"
-        "  gl renderer: %s\n"
-        "  gl version:  %s\n"
-        "  glsl ver:    %s\n",
-        str_or(eglQueryString(gl.display, EGL_VENDOR)),
-        str_or(eglQueryString(gl.display, EGL_VERSION)), major, minor,
-        str_or(eglQueryString(gl.display, EGL_CLIENT_APIS)),
-        gl_str(GL_VENDOR),
-        gl_str(GL_RENDERER),
-        gl_str(GL_VERSION),
-        gl_str(GL_SHADING_LANGUAGE_VERSION));
+    // Pull a bridge-side EGL dispatch table off `eglGetProcAddress`.
+    // The bridge doesn't link libEGL/libGLES; this is how plugins
+    // donate their loader and let the bridge invoke EGL/GL helpers.
+    ww_bridge_egl_dt_t bdt {};
+    ww_bridge_egl_dt_load(&bdt, eglGetProcAddress);
+    ww_bridge_egl_log_gpu_info("waywallen-mpv-renderer", &bdt,
+                               gl.display, major, minor);
 
     gl.fns.eglCreateImageKHR =
         reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
@@ -342,20 +329,6 @@ void init_egl(GlCtx& gl, const Options& opt) {
     init_slots(gl, opt);
 }
 
-const char* fourcc_name(uint32_t f) {
-    switch (f) {
-        case DRM_FORMAT_ABGR8888: return "ABGR8888";
-        case DRM_FORMAT_XBGR8888: return "XBGR8888";
-        case DRM_FORMAT_ARGB8888: return "ARGB8888";
-        case DRM_FORMAT_XRGB8888: return "XRGB8888";
-        case DRM_FORMAT_RGBA8888: return "RGBA8888";
-        case DRM_FORMAT_BGRA8888: return "BGRA8888";
-        case DRM_FORMAT_RGBX8888: return "RGBX8888";
-        case DRM_FORMAT_BGRX8888: return "BGRX8888";
-        default:                  return "?";
-    }
-}
-
 // Pick a (fourcc, modifier) pair that satisfies BOTH:
 //   1) EGL can import it as a non-external GL_TEXTURE_2D
 //      (i.e. eglQueryDmaBufModifiersEXT external_only == EGL_FALSE), AND
@@ -369,10 +342,10 @@ const char* fourcc_name(uint32_t f) {
 void pick_export_format(GlCtx& gl, const Options& opt) {
     // Mirrors libfunnel/src/egl.c: alpha + alpha-less, both byte orders.
     const uint32_t cands[] = {
-        DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888,
-        DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
-        DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
-        DRM_FORMAT_RGBX8888, DRM_FORMAT_BGRX8888,
+        WW_DRM_FORMAT_ABGR8888, WW_DRM_FORMAT_XBGR8888,
+        WW_DRM_FORMAT_ARGB8888, WW_DRM_FORMAT_XRGB8888,
+        WW_DRM_FORMAT_RGBA8888, WW_DRM_FORMAT_BGRA8888,
+        WW_DRM_FORMAT_RGBX8888, WW_DRM_FORMAT_BGRX8888,
     };
     for (uint32_t fourcc : cands) {
         EGLint count = 0;
@@ -381,7 +354,7 @@ void pick_export_format(GlCtx& gl, const Options& opt) {
                 0, nullptr, nullptr, &count) || count <= 0) {
             std::fprintf(stderr,
                 "waywallen-mpv-renderer: %s: no modifiers reported by EGL\n",
-                fourcc_name(fourcc));
+                ww_fourcc_name(fourcc));
             continue;
         }
         std::vector<EGLuint64KHR> mods(static_cast<size_t>(count));
@@ -391,12 +364,12 @@ void pick_export_format(GlCtx& gl, const Options& opt) {
                 mods.data(), ext_only.data(), &count)) {
             std::fprintf(stderr,
                 "waywallen-mpv-renderer: %s: eglQueryDmaBufModifiersEXT failed\n",
-                fourcc_name(fourcc));
+                ww_fourcc_name(fourcc));
             continue;
         }
         std::fprintf(stderr,
             "waywallen-mpv-renderer: %s: %d modifiers reported by EGL\n",
-            fourcc_name(fourcc), count);
+            ww_fourcc_name(fourcc), count);
         for (int i = 0; i < count; ++i) {
             std::fprintf(stderr, "  - 0x%016llx [external_only=%d]\n",
                 static_cast<unsigned long long>(mods[i]),
@@ -410,7 +383,7 @@ void pick_export_format(GlCtx& gl, const Options& opt) {
         if (usable.empty()) {
             std::fprintf(stderr,
                 "waywallen-mpv-renderer: %s: all %d modifiers are external_only\n",
-                fourcc_name(fourcc), count);
+                ww_fourcc_name(fourcc), count);
             continue;
         }
         // Float LINEAR to the front so GBM prefers it when allocator-feasible.
@@ -430,18 +403,61 @@ void pick_export_format(GlCtx& gl, const Options& opt) {
         if (!probe) {
             std::fprintf(stderr,
                 "waywallen-mpv-renderer: %s: gbm rejected all %zu non-external modifiers\n",
-                fourcc_name(fourcc), usable.size());
+                ww_fourcc_name(fourcc), usable.size());
             continue;
         }
         gl.export_fourcc           = fourcc;
         gl.export_modifier         = gbm_bo_get_modifier(probe);
         gl.use_explicit_modifier   = true;
+        gbm_bo_destroy(probe);
+
+        // Per-modifier probe — figure out the FULL subset of `usable`
+        // that GBM can actually produce. We need this for
+        // `format_caps`: the daemon's picker should see every option
+        // we could in principle satisfy, not just the one GBM picked
+        // first. Each successful probe destroys the BO; the slot
+        // pool is allocated separately later in `init_egl`.
+        gl.usable_modifiers.clear();
+        gl.usable_modifiers.reserve(usable.size());
+        for (uint64_t m : usable) {
+            uint64_t one[1] = { m };
+            gbm_bo* p = gbm_bo_create_with_modifiers2(
+                gl.gbm, opt.width, opt.height, fourcc,
+                one, 1, GBM_BO_USE_RENDERING);
+            if (p) {
+                gl.usable_modifiers.push_back(m);
+                gbm_bo_destroy(p);
+            }
+        }
+        // Defensive: gbm_bo_get_modifier() may return a value not
+        // exactly present in `usable` (some drivers normalize); make
+        // sure the pinned modifier is always in the advertised set.
+        bool present = false;
+        for (uint64_t m : gl.usable_modifiers) {
+            if (m == gl.export_modifier) { present = true; break; }
+        }
+        if (!present) gl.usable_modifiers.push_back(gl.export_modifier);
+
+        // Move the pinned modifier to index 0 so the daemon's picker
+        // — which honors producer order within a fourcc — lands on it
+        // in a single round, instead of iterating through every other
+        // modifier via `bind_failed` until it finds the one we
+        // actually allocated. The full set is still advertised so a
+        // future re-allocate-on-NegotiateBuffers refactor can use any
+        // of them without protocol changes.
+        for (size_t k = 0; k < gl.usable_modifiers.size(); ++k) {
+            if (gl.usable_modifiers[k] == gl.export_modifier) {
+                if (k != 0) std::swap(gl.usable_modifiers[0], gl.usable_modifiers[k]);
+                break;
+            }
+        }
+
         std::fprintf(stderr,
             "waywallen-mpv-renderer: chose export fourcc=%s modifier=0x%016llx "
-            "(probed from %zu non-external candidates)\n",
-            fourcc_name(fourcc),
-            static_cast<unsigned long long>(gl.export_modifier), usable.size());
-        gbm_bo_destroy(probe);
+            "(advertising %zu modifiers, probed from %zu non-external candidates)\n",
+            ww_fourcc_name(fourcc),
+            static_cast<unsigned long long>(gl.export_modifier),
+            gl.usable_modifiers.size(), usable.size());
         return;
     }
 
@@ -455,19 +471,22 @@ void pick_export_format(GlCtx& gl, const Options& opt) {
         "waywallen-mpv-renderer: modifier-aware probe failed, "
         "falling back to legacy implicit-modifier LINEAR import\n");
     const uint32_t legacy_cands[] = {
-        DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888,
-        DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
-        DRM_FORMAT_RGBA8888, DRM_FORMAT_BGRA8888,
-        DRM_FORMAT_RGBX8888, DRM_FORMAT_BGRX8888,
+        WW_DRM_FORMAT_ABGR8888, WW_DRM_FORMAT_XBGR8888,
+        WW_DRM_FORMAT_ARGB8888, WW_DRM_FORMAT_XRGB8888,
+        WW_DRM_FORMAT_RGBA8888, WW_DRM_FORMAT_BGRA8888,
+        WW_DRM_FORMAT_RGBX8888, WW_DRM_FORMAT_BGRX8888,
     };
     for (uint32_t fourcc : legacy_cands) {
         if (try_legacy_linear(gl, opt, fourcc)) {
             gl.export_fourcc         = fourcc;
             gl.use_explicit_modifier = false;
+            // Legacy path is LINEAR-only; that's the entire cap set.
+            gl.usable_modifiers.clear();
+            gl.usable_modifiers.push_back(DRM_FORMAT_MOD_LINEAR);
             std::fprintf(stderr,
                 "waywallen-mpv-renderer: chose export fourcc=%s "
                 "via legacy LINEAR (modifier=0x%016llx, no modifier attrs on import)\n",
-                fourcc_name(fourcc),
+                ww_fourcc_name(fourcc),
                 static_cast<unsigned long long>(gl.export_modifier));
             return;
         }
@@ -488,7 +507,7 @@ bool try_legacy_linear(GlCtx& gl, const Options& opt, uint32_t fourcc) {
     if (!bo) {
         std::fprintf(stderr,
             "waywallen-mpv-renderer: %s: legacy gbm_bo_create(USE_LINEAR) failed\n",
-            fourcc_name(fourcc));
+            ww_fourcc_name(fourcc));
         return false;
     }
     int      dmabuf_fd = gbm_bo_get_fd(bo);
@@ -515,7 +534,7 @@ bool try_legacy_linear(GlCtx& gl, const Options& opt, uint32_t fourcc) {
     if (img == EGL_NO_IMAGE_KHR) {
         std::fprintf(stderr,
             "waywallen-mpv-renderer: %s: legacy eglCreateImageKHR failed (egl_err=0x%04x)\n",
-            fourcc_name(fourcc), eglGetError());
+            ww_fourcc_name(fourcc), eglGetError());
     } else {
         GLuint tex = 0, fbo = 0;
         glGenTextures(1, &tex);
@@ -527,7 +546,7 @@ bool try_legacy_linear(GlCtx& gl, const Options& opt, uint32_t fourcc) {
             std::fprintf(stderr,
                 "waywallen-mpv-renderer: %s: legacy bind to TEXTURE_2D rejected "
                 "(gl_err=0x%04x — likely external_only)\n",
-                fourcc_name(fourcc), bind_err);
+                ww_fourcc_name(fourcc), bind_err);
         } else {
             glGenFramebuffers(1, &fbo);
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -540,7 +559,7 @@ bool try_legacy_linear(GlCtx& gl, const Options& opt, uint32_t fourcc) {
             } else {
                 std::fprintf(stderr,
                     "waywallen-mpv-renderer: %s: legacy FBO incomplete (status=0x%04x)\n",
-                    fourcc_name(fourcc), st);
+                    ww_fourcc_name(fourcc), st);
             }
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
@@ -651,7 +670,7 @@ void init_slots(GlCtx& gl, const Options& opt) {
                 i, fbo_status, gl_err_after_image, glGetError(),
                 opt.width, opt.height, s.stride, s.offset,
                 static_cast<unsigned long long>(s.drm_modifier),
-                fourcc_name(gl.export_fourcc), s.dmabuf_fd);
+                ww_fourcc_name(gl.export_fourcc), s.dmabuf_fd);
             die("export FBO incomplete");
         }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -671,18 +690,29 @@ int export_sync_fd(GlCtx& gl) {
     return fd;
 }
 
+// Tear down the per-slot DMA-BUF and GL state without touching the EGL
+// display, GBM device, or DRM fd. Idempotent: zero-handle slots are
+// skipped so callers can re-run after a partial init or call this
+// before re-allocating slots for a new modifier (see handle_negotiate).
+void release_slots(GlCtx& gl) {
+    for (auto& s : gl.slots) {
+        if (gl.display != EGL_NO_DISPLAY && s.egl_image != EGL_NO_IMAGE_KHR) {
+            gl.fns.eglDestroyImageKHR(gl.display, s.egl_image);
+            s.egl_image = EGL_NO_IMAGE_KHR;
+        }
+        if (s.export_fbo)     { glDeleteFramebuffers(1, &s.export_fbo); s.export_fbo = 0; }
+        if (s.export_texture) { glDeleteTextures(1, &s.export_texture); s.export_texture = 0; }
+        if (s.mpv_fbo)        { glDeleteFramebuffers(1, &s.mpv_fbo); s.mpv_fbo = 0; }
+        if (s.mpv_texture)    { glDeleteTextures(1, &s.mpv_texture); s.mpv_texture = 0; }
+        if (s.dmabuf_fd >= 0) { close(s.dmabuf_fd); s.dmabuf_fd = -1; }
+        if (s.bo)             { gbm_bo_destroy(s.bo); s.bo = nullptr; }
+        s.size = 0; s.stride = 0; s.offset = 0; s.drm_modifier = 0;
+    }
+}
+
 void destroy_gl(GlCtx& gl) {
     if (gl.display != EGL_NO_DISPLAY) {
-        for (auto& s : gl.slots) {
-            if (s.egl_image != EGL_NO_IMAGE_KHR)
-                gl.fns.eglDestroyImageKHR(gl.display, s.egl_image);
-            if (s.export_fbo)     glDeleteFramebuffers(1, &s.export_fbo);
-            if (s.export_texture) glDeleteTextures(1, &s.export_texture);
-            if (s.mpv_fbo)        glDeleteFramebuffers(1, &s.mpv_fbo);
-            if (s.mpv_texture)    glDeleteTextures(1, &s.mpv_texture);
-            if (s.dmabuf_fd >= 0) close(s.dmabuf_fd);
-            if (s.bo) gbm_bo_destroy(s.bo);
-        }
+        release_slots(gl);
         eglMakeCurrent(gl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (gl.context != EGL_NO_CONTEXT)
             eglDestroyContext(gl.display, gl.context);
@@ -847,12 +877,23 @@ struct HostState {
     // Per-slot release point assigned at last submit. 0 means "never
     // submitted yet — no wait needed". Updated under `send_mu`.
     uint64_t              last_release_point[SLOT_COUNT] { 0, 0, 0 };
+    // Modifier-negotiation v2 gate. Stays false until the reader
+    // thread receives the daemon's first `NegotiateBuffers` and the
+    // initial `bind_buffers` is emitted. The main render loop blocks
+    // on `wake.cv` until this flips so we don't speculatively
+    // allocate a pool the daemon may need to renegotiate.
+    std::atomic<bool>     negotiated { false };
+    // Pending NegotiateBuffers request handed off from the reader
+    // thread to the main thread. The reader can't perform GL work
+    // (the EGL context is bound to main), so when the daemon picks
+    // a `(fourcc, modifier)` other than the one we currently have
+    // slots for, we stash the request here and wake main, which
+    // tears down + re-allocates slots before sending bind_buffers.
+    std::mutex            neg_mu;
+    bool                  neg_pending { false };
+    uint32_t              neg_fourcc { 0 };
+    uint64_t              neg_modifier { 0 };
 };
-
-// Bit set passed on the wire as `bind_buffers.flags` and on
-// `configure_buffers.flags`. Local mirror of the daemon-side constant
-// so we don't pull in extra headers.
-static constexpr uint32_t WW_BUF_HOST_VISIBLE = 1u << 0;
 
 void wake_up(WakeState& w) {
     {
@@ -1057,10 +1098,111 @@ bool wait_release_point(int drm_fd, uint32_t handle, uint64_t point,
 
 
 // ---------------------------------------------------------------------------
+// Negotiation handler (main thread)
+// ---------------------------------------------------------------------------
+
+// Apply a NegotiateBuffers request. If the daemon picked the modifier
+// we currently have slots for, just (re-)emit bind_buffers. If it
+// picked a different modifier from our advertised `usable_modifiers`,
+// drain in-flight GL work, tear down the slot pool, re-allocate it
+// with the new modifier, and emit bind_buffers. Out-of-set requests
+// (different fourcc or modifier we never advertised) get bind_failed
+// — the daemon will blacklist and re-pick. Must run on the thread
+// that owns the EGL context (main).
+void handle_negotiate_request(HostState& s, const Options& opt, GlCtx& gl,
+                              uint32_t nb_fourcc, uint64_t nb_modifier) {
+    bool fourcc_ok   = (nb_fourcc == gl.export_fourcc);
+    bool modifier_ok = false;
+    if (fourcc_ok) {
+        for (uint64_t m : gl.usable_modifiers) {
+            if (m == nb_modifier) { modifier_ok = true; break; }
+        }
+    }
+    if (!fourcc_ok || !modifier_ok) {
+        std::fprintf(stderr,
+                     "waywallen-mpv-renderer: NegotiateBuffers "
+                     "(fourcc=0x%08x modifier=0x%016llx) not in advertised "
+                     "set — reporting bind_failed for daemon retry\n",
+                     nb_fourcc,
+                     static_cast<unsigned long long>(nb_modifier));
+        const char* msg = "fourcc/modifier not in advertised format_caps";
+        int rc;
+        {
+            std::lock_guard<std::mutex> lock(s.send_mu);
+            rc = ww_bridge_send_bind_failed(s.sock, nb_fourcc, nb_modifier,
+                                            /*reason=*/2 /* feature_unsupported */,
+                                            msg);
+        }
+        if (rc != 0) {
+            std::fprintf(stderr,
+                         "waywallen-mpv-renderer: send bind_failed failed: %d\n",
+                         rc);
+        }
+        return;
+    }
+
+    if (nb_modifier != gl.export_modifier) {
+        std::fprintf(stderr,
+                     "waywallen-mpv-renderer: NegotiateBuffers picked "
+                     "modifier=0x%016llx (was 0x%016llx) — re-allocating slots\n",
+                     static_cast<unsigned long long>(nb_modifier),
+                     static_cast<unsigned long long>(gl.export_modifier));
+        // Drain in-flight GPU work referencing existing slot BOs
+        // before we destroy them.
+        glFinish();
+        release_slots(gl);
+        gl.export_modifier = nb_modifier;
+        // init_slots reads gl.export_modifier and rebuilds the entire
+        // slot pool (BOs, EGL images, FBOs) for the new modifier. The
+        // probe at pick_export_format already verified GBM can produce
+        // each modifier in usable_modifiers individually, so this
+        // call is expected to succeed; if it doesn't, init_slots
+        // calls die().
+        init_slots(gl, opt);
+        // Slot identities changed — back-pressure points reference
+        // the *old* BOs. Reset so the next render frame doesn't wait
+        // on a syncobj point that pertains to a destroyed buffer.
+        std::lock_guard<std::mutex> lock(s.send_mu);
+        for (uint32_t i = 0; i < SLOT_COUNT; ++i) {
+            s.last_release_point[i] = 0;
+        }
+    }
+
+    std::fprintf(stderr,
+                 "waywallen-mpv-renderer: NegotiateBuffers honored "
+                 "(fourcc=0x%08x modifier=0x%016llx) — emitting bind_buffers\n",
+                 nb_fourcc,
+                 static_cast<unsigned long long>(nb_modifier));
+    send_bind(s, opt, gl);
+    s.negotiated.store(true, std::memory_order_release);
+}
+
+// Pull any pending NegotiateBuffers request stashed by the reader
+// thread and apply it on this (main) thread. Returns true if a
+// request was processed.
+bool drain_pending_negotiate(HostState& s, const Options& opt, GlCtx& gl) {
+    bool have = false;
+    uint32_t pf = 0;
+    uint64_t pm = 0;
+    {
+        std::lock_guard<std::mutex> lk(s.neg_mu);
+        if (s.neg_pending) {
+            have = true;
+            pf = s.neg_fourcc;
+            pm = s.neg_modifier;
+            s.neg_pending = false;
+        }
+    }
+    if (have) handle_negotiate_request(s, opt, gl, pf, pm);
+    return have;
+}
+
+
+// ---------------------------------------------------------------------------
 // Control reader
 // ---------------------------------------------------------------------------
 
-void apply_control(HostState& s, MpvState& m, const Options& opt, GlCtx& gl,
+void apply_control(HostState& s, MpvState& m, WakeState& wake,
                    const ww_bridge_control_t& c) {
     switch (c.op) {
     case WW_REQ_HELLO:
@@ -1090,23 +1232,22 @@ void apply_control(HostState& s, MpvState& m, const Options& opt, GlCtx& gl,
     case WW_REQ_SHUTDOWN:
         s.shutdown.store(true, std::memory_order_release);
         break;
-    case WW_REQ_CONFIGURE_BUFFERS:
-        // GBM/LINEAR is intrinsically GTT (host-visible); we cannot
-        // physically downgrade to DEVICE_LOCAL. Acknowledge the
-        // request by re-emitting bind_buffers with a bumped generation
-        // — the wire `flags` field will report what we actually have
-        // (BUF_HOST_VISIBLE), and the daemon's reader thread will
-        // clear pending_configure with a warn log if that doesn't
-        // match what was asked for.
-        if (c.u.configure_buffers.flags != s.flags) {
-            std::fprintf(stderr,
-                         "waywallen-mpv-renderer: ConfigureBuffers asked for "
-                         "flags=0x%x but we can only do flags=0x%x (GBM LINEAR "
-                         "→ GTT); answering with current placement\n",
-                         c.u.configure_buffers.flags, s.flags);
+    case WW_REQ_NEGOTIATE_BUFFERS: {
+        const auto& nb = c.u.negotiate_buffers;
+        // We can't run GL/EGL work on this thread — the context is
+        // bound to main. Stash the request and wake main, which will
+        // honor it (re-allocating slots if the daemon picked a
+        // different modifier from our advertised set) and emit
+        // bind_buffers, or report bind_failed if out of set.
+        {
+            std::lock_guard<std::mutex> lk(s.neg_mu);
+            s.neg_fourcc   = nb.fourcc;
+            s.neg_modifier = nb.modifier;
+            s.neg_pending  = true;
         }
-        send_bind(s, opt, gl);
+        wake_up(wake);
         break;
+    }
     default:
         std::fprintf(stderr,
                      "waywallen-mpv-renderer: unknown control op %d\n",
@@ -1115,8 +1256,7 @@ void apply_control(HostState& s, MpvState& m, const Options& opt, GlCtx& gl,
     }
 }
 
-void reader_loop(HostState& s, MpvState& m, const Options& opt, GlCtx& gl,
-                 WakeState& wake) {
+void reader_loop(HostState& s, MpvState& m, WakeState& wake) {
     while (!s.shutdown.load(std::memory_order_acquire)) {
         ww_bridge_control_t msg {};
         int                 rc = ww_bridge_recv_control(s.sock, &msg);
@@ -1130,7 +1270,7 @@ void reader_loop(HostState& s, MpvState& m, const Options& opt, GlCtx& gl,
             wake_up(wake);
             return;
         }
-        apply_control(s, m, opt, gl, msg);
+        apply_control(s, m, wake, msg);
         ww_bridge_control_free(&msg);
     }
 }
@@ -1183,6 +1323,53 @@ int main(int argc, char** argv) {
                  "waywallen-mpv-renderer: ready drm_render=%u:%u\n",
                  drm_render_major, drm_render_minor);
 
+    // Modifier-negotiation v2 — advertise the full set of modifiers
+    // both EGL can import and GBM can produce for `export_fourcc`.
+    // The daemon's picker intersects with each consumer's
+    // `consumer_caps`; the renderer accepts any of them via the
+    // re-allocate-on-NegotiateBuffers path. device_uuid stays NULL:
+    // EGL doesn't expose a UUID accessor in this codebase yet (could
+    // pull eglQueryDeviceStringEXT for EGL_DEVICE_UUID_EXT but that's
+    // a Mesa-specific path). The picker falls back to DRM major:minor
+    // for same-device matching.
+    {
+        const std::vector<uint64_t>& probed = gl.usable_modifiers;
+        const uint32_t fourccs[1]    = { gl.export_fourcc };
+        const uint32_t mod_counts[1] = { static_cast<uint32_t>(probed.size()) };
+        std::vector<uint32_t> usages(probed.size(), WW_USAGE_SAMPLED);
+        std::vector<uint32_t> plane_counts(probed.size(), 1u);
+
+        ww_format_caps_caller_t m {};
+        m.fourccs            = fourccs;
+        m.fourccs_count      = 1;
+        m.mod_counts         = mod_counts;
+        m.mod_counts_count   = 1;
+        m.modifiers          = probed.data();
+        m.modifiers_count    = static_cast<uint32_t>(probed.size());
+        m.usages             = usages.data();
+        m.usages_count       = static_cast<uint32_t>(usages.size());
+        m.plane_counts       = plane_counts.data();
+        m.plane_counts_count = static_cast<uint32_t>(plane_counts.size());
+        m.drm_render_major   = drm_render_major;
+        m.drm_render_minor   = drm_render_minor;
+        // GBM-allocated LINEAR BOs land in HOST_VISIBLE / GTT on every
+        // driver we care about (see HostState.flags comment).
+        m.mem_hints          = WW_MEM_HINT_HOST_VISIBLE;
+        m.sync_caps          = WW_SYNC_SYNCOBJ_TIMELINE | WW_SYNC_SYNCOBJ_BINARY;
+        m.color_caps         = WW_COLOR_ENC_SRGB | WW_COLOR_RANGE_LIMITED
+                             | WW_COLOR_ALPHA_PREMUL;
+        m.extent_max_w       = 16384;
+        m.extent_max_h       = 16384;
+        if (int rc = ww_bridge_send_format_caps_v2(host.sock, &m); rc != 0)
+            die("send format_caps failed: " + std::to_string(rc));
+        std::fprintf(stderr,
+                     "waywallen-mpv-renderer: sent format_caps "
+                     "(fourcc=0x%08x %zu modifiers, pinned=0x%016llx)\n",
+                     gl.export_fourcc,
+                     gl.usable_modifiers.size(),
+                     static_cast<unsigned long long>(gl.export_modifier));
+    }
+
     // Allocate the release timeline syncobj on the GBM-owned DRM fd
     // and send the OPAQUE_FD export to the daemon. Required before the
     // first frame_ready (which carries a release_point on this
@@ -1197,9 +1384,29 @@ int main(int argc, char** argv) {
                      "waywallen-mpv-renderer: no DRM fd, skipping release_syncobj\n");
     }
 
-    send_bind(host, opt, gl);
+    std::thread reader([&]() { reader_loop(host, mpv, wake); });
 
-    std::thread reader([&]() { reader_loop(host, mpv, opt, gl, wake); });
+    // Iter 3 step 2 (parity with image renderer's iter 3c): no
+    // speculative initial bind. Block until the daemon issues its
+    // first `NegotiateBuffers`; the reader thread stashes it and
+    // wakes us, and we apply it here (potentially re-allocating the
+    // slot pool to match the picked modifier). Without this, the mpv
+    // producer would publish a pool the daemon may need to
+    // renegotiate, breaking the contract that buffers do not flow
+    // before both peers agree on the scheme.
+    while (!host.negotiated.load(std::memory_order_acquire)
+           && !host.shutdown.load(std::memory_order_acquire)) {
+        {
+            std::unique_lock<std::mutex> lk(wake.mu);
+            wake.cv.wait(lk, [&] {
+                return wake.pending
+                       || host.shutdown.load(std::memory_order_acquire);
+            });
+            wake.pending = false;
+        }
+        if (host.shutdown.load(std::memory_order_acquire)) break;
+        drain_pending_negotiate(host, opt, gl);
+    }
 
     uint32_t slot = 0;
     while (!host.shutdown.load(std::memory_order_acquire)) {
@@ -1215,6 +1422,11 @@ int main(int argc, char** argv) {
             wake.pending = false;
         }
         if (host.shutdown.load(std::memory_order_acquire)) break;
+
+        // Apply any runtime renegotiation request the reader stashed
+        // (e.g. display caps changed). Tears down + re-allocates slots
+        // for the new modifier when needed; safe between frames.
+        drain_pending_negotiate(host, opt, gl);
 
         mpv_drain_events(mpv, host.shutdown);
         if (host.shutdown.load(std::memory_order_acquire)) break;

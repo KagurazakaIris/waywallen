@@ -433,7 +433,16 @@ fn run(instance: &Instance, args: &Args) -> Result<()> {
                 s2.store(true, Ordering::SeqCst);
                 return;
             }
-            Ok((ControlMsg::ConfigureBuffers { flags }, _)) => {
+            Ok((ControlMsg::NegotiateBuffers { mem_hint, .. }, _)) => {
+                // Modifier-negotiation v2 — map mem_hint → BUF_HOST_VISIBLE
+                // (bit 0). The Rust test renderer doesn't yet honor
+                // fourcc/modifier overrides; it always allocates
+                // ABGR8888 + LINEAR. The picker collapses to that for
+                // prototype peer combos so the simplification is safe.
+                const BUF_HOST_VISIBLE: u32 = 1 << 0;
+                const MEM_HINT_HOST_VISIBLE: u32 = 1 << 1;
+                let flags =
+                    if mem_hint & MEM_HINT_HOST_VISIBLE != 0 { BUF_HOST_VISIBLE } else { 0 };
                 if let Ok(mut g) = p2.lock() {
                     *g = Some(flags);
                 }

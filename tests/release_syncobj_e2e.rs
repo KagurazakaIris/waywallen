@@ -17,8 +17,8 @@ use std::time::Duration;
 
 mod common;
 
-use waywallen::ipc::generated::Event as EventMsg;
-use waywallen::ipc::uds::recv_event;
+use waywallen::ipc::generated::{Event as EventMsg, Request as ControlMsg};
+use waywallen::ipc::uds::{recv_event, send_control};
 use waywallen::sync::DrmDevice;
 
 fn renderer_bin() -> Option<PathBuf> {
@@ -92,6 +92,7 @@ fn release_syncobj_round_trip() {
     let mut saw_ready = false;
     let mut saw_release_syncobj_fd: Option<OwnedFd> = None;
     let mut saw_frame_with_release_point = false;
+    let mut saw_format_caps = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
 
     while std::time::Instant::now() < deadline {
@@ -105,6 +106,86 @@ fn release_syncobj_round_trip() {
         match msg {
             EventMsg::Ready { .. } => {
                 saw_ready = true;
+            }
+            EventMsg::FormatCaps {
+                fourccs,
+                mod_counts,
+                modifiers,
+                usages,
+                plane_counts,
+                device_uuid,
+                driver_uuid,
+                drm_render_major,
+                drm_render_minor,
+                mem_hints,
+                sync_caps,
+                color_caps,
+                extent_max_w,
+                extent_max_h,
+            } => {
+                use waywallen::negotiate as N;
+                let caps = N::unflatten_caps(
+                    &fourccs,
+                    &mod_counts,
+                    &modifiers,
+                    &usages,
+                    &plane_counts,
+                    &device_uuid,
+                    &driver_uuid,
+                    waywallen::renderer_manager::DrmNode {
+                        major: drm_render_major,
+                        minor: drm_render_minor,
+                    },
+                    sync_caps,
+                    color_caps,
+                    mem_hints,
+                    (extent_max_w, extent_max_h),
+                )
+                .expect("FormatCaps unflatten");
+                // Producer must advertise ABGR8888.
+                let abgr = caps
+                    .formats
+                    .by_fourcc
+                    .get(&N::DRM_FORMAT_ABGR8888)
+                    .expect("FormatCaps must list ABGR8888");
+                assert!(
+                    abgr.iter().any(|m| m.modifier == N::DRM_FORMAT_MOD_LINEAR),
+                    "FormatCaps must include LINEAR modifier"
+                );
+                // Mesa always reports a non-zero device UUID.
+                assert!(
+                    caps.identity.device_uuid != [0u8; 16],
+                    "Mesa device_uuid should be non-zero"
+                );
+                assert!(
+                    caps.mem_hint & N::MEM_HINT_HOST_VISIBLE != 0,
+                    "image renderer should advertise HOST_VISIBLE"
+                );
+                assert!(
+                    caps.sync & N::SYNC_SYNCOBJ_TIMELINE != 0,
+                    "image renderer should advertise SYNCOBJ_TIMELINE"
+                );
+                saw_format_caps = true;
+
+                // Iter 3c: renderer waits for NegotiateBuffers before
+                // binding. Drive that here — the test plays the
+                // daemon's role.
+                send_control(
+                    &stream,
+                    &ControlMsg::NegotiateBuffers {
+                        fourcc: N::DRM_FORMAT_ABGR8888,
+                        modifier: N::DRM_FORMAT_MOD_LINEAR,
+                        plane_count: 1,
+                        sync_mode: N::SYNC_SYNCOBJ_TIMELINE,
+                        color: N::DEFAULT_COLOR,
+                        mem_hint: N::MEM_HINT_HOST_VISIBLE,
+                        extent_w: 640,
+                        extent_h: 360,
+                        count: 1,
+                    },
+                    &[],
+                )
+                .expect("send NegotiateBuffers");
             }
             EventMsg::ReleaseSyncobj => {
                 assert_eq!(fds.len(), 1, "ReleaseSyncobj expected exactly 1 fd");
@@ -139,6 +220,7 @@ fn release_syncobj_round_trip() {
     }
 
     assert!(saw_ready, "never saw Ready");
+    assert!(saw_format_caps, "never saw FormatCaps");
     assert!(
         saw_release_syncobj_fd.is_some(),
         "never saw ReleaseSyncobj event with importable drm_syncobj fd"

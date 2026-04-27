@@ -43,8 +43,8 @@ mod tests {
 
     #[test]
     fn protocol_identity() {
-        assert_eq!(PROTOCOL_NAME, "waywallen-display-v1");
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_NAME, "waywallen-display-v2");
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]

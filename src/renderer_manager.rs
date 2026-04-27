@@ -171,6 +171,23 @@ pub struct RendererHandle {
     /// release fences onto each frame's `release_point`.
     release_syncobj: Arc<StdMutex<Option<OwnedFd>>>,
 
+    /// Modifier-negotiation capabilities the producer declared in
+    /// its `FormatCaps` event (sent once after `Ready`, before any
+    /// `BindBuffers`). The router pairs this with each consumer's
+    /// `consumer_caps` to compute a `NegotiatedScheme`. Stays `None`
+    /// until the event arrives — older renderers that don't
+    /// implement Iter 2 yet leave it empty, in which case the
+    /// daemon skips negotiation for them and Iter 1 behavior
+    /// (blind forward) prevails.
+    format_caps: Arc<StdMutex<Option<crate::negotiate::PeerCaps>>>,
+
+    /// Last `NegotiatedScheme` the daemon dispatched via
+    /// `NegotiateBuffers` to this renderer. Used for idempotence in
+    /// `send_negotiate_buffers` — repeat calls with the same scheme
+    /// short-circuit. `None` until the first dispatch.
+    last_dispatched_scheme:
+        Arc<StdMutex<Option<crate::negotiate::NegotiatedScheme>>>,
+
     /// Sink for per-frame [`crate::sync::FrameRecord`]s. The display
     /// endpoint pushes one record per consumer per frame; the reaper
     /// task (spawned alongside this handle) drains them, waits for
@@ -245,6 +262,64 @@ impl RendererHandle {
         let fd = guard.as_ref()?;
         let dup_raw = nix::unistd::dup(fd.as_raw_fd()).ok()?;
         Some(unsafe { OwnedFd::from_raw_fd(dup_raw) })
+    }
+
+    /// Borrow a clone of the producer's declared modifier-negotiation
+    /// capabilities. Returns `None` until the `FormatCaps` event has
+    /// arrived (or forever, for renderers that haven't been ported to
+    /// Iter 2). The router calls this on every reconcile pass; it's
+    /// cheap (cloning a HashMap of small structs).
+    pub fn format_caps(&self) -> Option<crate::negotiate::PeerCaps> {
+        self.format_caps.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Mutate the producer's blacklist with `(fourcc, modifier)`. The
+    /// blacklist lives inside the producer's [`PeerCaps`] and is
+    /// consulted on every `negotiate::pick`. No-op if FormatCaps
+    /// haven't arrived yet (legacy renderer).
+    ///
+    /// Returns `true` when the entry was newly inserted. The router
+    /// uses the boolean to decide whether to re-run the picker (a
+    /// duplicate insert means the renderer reported the same
+    /// (fourcc, modifier) twice — already handled).
+    pub fn blacklist_format(&self, fourcc: u32, modifier: u64) -> bool {
+        let Ok(mut guard) = self.format_caps.lock() else {
+            return false;
+        };
+        let Some(caps) = guard.as_mut() else {
+            return false;
+        };
+        caps.blacklist.insert((fourcc, modifier))
+    }
+
+    /// Most recently dispatched [`crate::negotiate::NegotiatedScheme`]
+    /// for this renderer. `None` until the daemon has run a successful
+    /// `pick` and called `send_negotiate_buffers`. Used by the router
+    /// to gate `Bind`/`Frame` dispatch — frames are silently held
+    /// until `bind_snapshot` matches the dispatched scheme.
+    pub fn current_scheme(&self) -> Option<crate::negotiate::NegotiatedScheme> {
+        self.last_dispatched_scheme.lock().ok().and_then(|g| *g)
+    }
+
+    /// True iff the renderer's most recent `BindBuffers` snapshot
+    /// matches the most recently dispatched [`crate::negotiate::NegotiatedScheme`]
+    /// on `(fourcc, modifier)`. Returns `false` if either side is
+    /// missing — the gate stays closed until both arrive. Caller is
+    /// responsible for ensuring v2 negotiation actually applies (i.e.
+    /// both peers shipped caps); for legacy peers this method has no
+    /// useful answer.
+    pub fn scheme_satisfied(&self) -> bool {
+        let Some(scheme) = self.current_scheme() else {
+            return false;
+        };
+        let snap = self.bind_snapshot();
+        let Ok(guard) = snap.lock() else {
+            return false;
+        };
+        match guard.as_ref() {
+            Some(s) => s.fourcc == scheme.fourcc && s.modifier == scheme.modifier,
+            None => false,
+        }
     }
 
     /// Push a per-frame [`crate::sync::FrameRecord`] to the reaper.
@@ -471,6 +546,8 @@ impl RendererManager {
             Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let release_syncobj: Arc<StdMutex<Option<OwnedFd>>> =
             Arc::new(StdMutex::new(None));
+        let format_caps: Arc<StdMutex<Option<crate::negotiate::PeerCaps>>> =
+            Arc::new(StdMutex::new(None));
         let pending_configure: Arc<StdMutex<Option<u32>>> = Arc::new(StdMutex::new(None));
 
         let sock = Arc::new(StdMutex::new(std_stream));
@@ -479,6 +556,7 @@ impl RendererManager {
         let reader_snapshot = bind_snapshot.clone();
         let reader_sync_fds = sync_fds.clone();
         let reader_release_syncobj = release_syncobj.clone();
+        let reader_format_caps = format_caps.clone();
         let reader_pending = pending_configure.clone();
         let reader_id = id.clone();
         let reader_reap_tx = self.reap_tx.clone();
@@ -490,6 +568,7 @@ impl RendererManager {
                 reader_snapshot,
                 reader_sync_fds,
                 reader_release_syncobj,
+                reader_format_caps,
                 reader_pending,
                 reader_reap_tx,
             );
@@ -530,6 +609,8 @@ impl RendererManager {
             bind_snapshot,
             sync_fds,
             release_syncobj,
+            format_caps,
+            last_dispatched_scheme: Arc::new(StdMutex::new(None)),
             frame_record_tx,
             pending_configure,
             child: Arc::new(TokioMutex::new(Some(child))),
@@ -611,32 +692,47 @@ impl RendererManager {
         }
     }
 
-    /// Ask the renderer to re-export its buffer pool with new placement
-    /// flags. Sets the renderer's `pending_configure` slot before
-    /// dispatching the wire message so the router doesn't double-fire
-    /// while the renderer is mid-rebuild. The renderer answers with a
-    /// fresh `BindBuffers { generation += 1, flags }` event which the
-    /// reader thread will broadcast and which clears `pending_configure`.
-    pub async fn send_configure_buffers(&self, id: &str, flags: u32) -> Result<()> {
+    /// Modifier-negotiation v2 dispatch — replaces the deleted
+    /// `send_configure_buffers`.
+    /// Idempotent: returns Ok without sending if `scheme` matches the
+    /// last-dispatched scheme cached on the renderer handle.
+    pub async fn send_negotiate_buffers(
+        &self,
+        id: &str,
+        scheme: crate::negotiate::NegotiatedScheme,
+    ) -> Result<()> {
         let handle = self
             .get(id)
             .await
             .ok_or_else(|| anyhow!("unknown renderer: {id}"))?;
-        if let Ok(mut guard) = handle.pending_configure.lock() {
-            *guard = Some(flags);
-        }
-        log::info!("renderer {id}: ConfigureBuffers(flags=0x{flags:x})");
-        if let Err(e) = self
-            .send_control(id, ControlMsg::ConfigureBuffers { flags })
-            .await
-        {
-            // Roll back the pending marker so a future retry can fire.
-            if let Ok(mut guard) = handle.pending_configure.lock() {
-                if guard.as_ref() == Some(&flags) {
-                    *guard = None;
-                }
+        // Idempotence: skip if we've already dispatched this exact scheme.
+        if let Ok(guard) = handle.last_dispatched_scheme.lock() {
+            if guard.as_ref() == Some(&scheme) {
+                return Ok(());
             }
-            return Err(e);
+        }
+        log::info!(
+            "renderer {id}: NegotiateBuffers fourcc=0x{:08x} modifier=0x{:x} \
+             plane_count={} sync=0x{:x} color=0x{:x} mem_hint=0x{:x} \
+             extent={}x{} count={}",
+            scheme.fourcc, scheme.modifier, scheme.plane_count,
+            scheme.sync_mode, scheme.color, scheme.mem_hint,
+            scheme.extent.0, scheme.extent.1, scheme.count,
+        );
+        let msg = ControlMsg::NegotiateBuffers {
+            fourcc: scheme.fourcc,
+            modifier: scheme.modifier,
+            plane_count: scheme.plane_count,
+            sync_mode: scheme.sync_mode,
+            color: scheme.color,
+            mem_hint: scheme.mem_hint,
+            extent_w: scheme.extent.0,
+            extent_h: scheme.extent.1,
+            count: scheme.count,
+        };
+        self.send_control(id, msg).await?;
+        if let Ok(mut guard) = handle.last_dispatched_scheme.lock() {
+            *guard = Some(scheme);
         }
         Ok(())
     }
@@ -714,6 +810,7 @@ fn run_reader(
     bind_snapshot: Arc<StdMutex<Option<BindSnapshot>>>,
     sync_fds: Arc<StdMutex<std::collections::VecDeque<(u64, OwnedFd)>>>,
     release_syncobj: Arc<StdMutex<Option<OwnedFd>>>,
+    format_caps: Arc<StdMutex<Option<crate::negotiate::PeerCaps>>>,
     pending_configure: Arc<StdMutex<Option<u32>>>,
     reap_tx: tokio::sync::mpsc::UnboundedSender<RendererId>,
 ) {
@@ -857,6 +954,76 @@ fn run_reader(
                 *guard = Some(fd);
                 log::info!("renderer {id}: ReleaseSyncobj imported");
             }
+        } else if let EventMsg::FormatCaps {
+            ref fourccs,
+            ref mod_counts,
+            ref modifiers,
+            ref usages,
+            ref plane_counts,
+            ref device_uuid,
+            ref driver_uuid,
+            drm_render_major,
+            drm_render_minor,
+            mem_hints,
+            sync_caps,
+            color_caps,
+            extent_max_w,
+            extent_max_h,
+        } = msg
+        {
+            let drm = DrmNode {
+                major: drm_render_major,
+                minor: drm_render_minor,
+            };
+            match crate::negotiate::unflatten_caps(
+                fourccs,
+                mod_counts,
+                modifiers,
+                usages,
+                plane_counts,
+                device_uuid,
+                driver_uuid,
+                drm,
+                sync_caps,
+                color_caps,
+                mem_hints,
+                (extent_max_w, extent_max_h),
+            ) {
+                Ok(caps) => {
+                    if let Ok(mut guard) = format_caps.lock() {
+                        if guard.is_some() {
+                            log::warn!(
+                                "renderer {id}: FormatCaps received twice; \
+                                 replacing previous caps"
+                            );
+                        }
+                        let prefix = format!("renderer {id}: format_caps");
+                        log::info!(
+                            "{prefix}: imported {} fourcc{}",
+                            caps.formats.by_fourcc.len(),
+                            if caps.formats.by_fourcc.len() == 1 { "" } else { "s" },
+                        );
+                        caps.log_dump(&prefix);
+                        *guard = Some(caps);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("renderer {id}: FormatCaps malformed: {e:?}");
+                }
+            }
+        } else if let EventMsg::BindFailed {
+            fourcc,
+            modifier,
+            reason,
+            ref message,
+        } = msg
+        {
+            // Iter 5 wires the daemon-side blacklist + retry. For now
+            // surface the failure for debugging.
+            log::warn!(
+                "renderer {id}: BindFailed fourcc=0x{fourcc:08x} \
+                 modifier=0x{modifier:x} reason={reason} msg={message:?}"
+            );
         } else if !fds.is_empty() {
             log::warn!(
                 "renderer {id}: unexpected fds on event {msg:?}, dropping"
@@ -926,6 +1093,26 @@ fn _assert_path_ok<P: AsRef<std::path::Path>>(_p: P) {} // compile-time shim
 
 #[cfg(test)]
 impl RendererHandle {
+    /// Test-only: inject a `PeerCaps` so router-level negotiation
+    /// tests can pretend the renderer shipped a `FormatCaps` event.
+    /// Replaces whatever was there.
+    pub fn test_set_format_caps(&self, caps: crate::negotiate::PeerCaps) {
+        if let Ok(mut g) = self.format_caps.lock() {
+            *g = Some(caps);
+        }
+    }
+
+    /// Test-only: read the producer's blacklist length. Lets a
+    /// router-side test assert that `on_renderer_bind_failed`
+    /// actually inserted into the producer caps.
+    pub fn test_blacklist_len(&self) -> usize {
+        self.format_caps
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.blacklist.len()))
+            .unwrap_or(0)
+    }
+
     /// Construct a `RendererHandle` with no running child process.
     /// Useful for routing-table tests that need a handle to register
     /// against the router but never push frames through it.
@@ -947,6 +1134,8 @@ impl RendererHandle {
             bind_snapshot: Arc::new(StdMutex::new(None)),
             sync_fds: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
             release_syncobj: Arc::new(StdMutex::new(None)),
+            format_caps: Arc::new(StdMutex::new(None)),
+            last_dispatched_scheme: Arc::new(StdMutex::new(None)),
             frame_record_tx: None,
             pending_configure: Arc::new(StdMutex::new(None)),
             child: Arc::new(TokioMutex::new(None)),

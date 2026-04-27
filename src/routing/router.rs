@@ -90,6 +90,12 @@ pub struct DisplayRegistration {
     /// path (force `BUF_HOST_VISIBLE` on every connected renderer).
     pub gpu: DrmNode,
     pub properties: Vec<(String, String)>,
+    /// Modifier-negotiation capabilities the consumer declared in
+    /// its `consumer_caps` request (sent immediately after
+    /// `register_display`). `None` if the consumer hasn't been
+    /// ported to v2; the router falls back to legacy behavior in
+    /// that case.
+    pub consumer_caps: Option<crate::negotiate::PeerCaps>,
 }
 
 /// Returned from `register_display` — the assigned id plus the rx end
@@ -200,6 +206,11 @@ struct DisplayState {
     /// Last `buffer_generation` we sent in a `Bind` to this display.
     /// Tracked so a follow-up `Unbind` retires the right gen.
     last_buffer_generation: Option<u64>,
+    /// Consumer's modifier-negotiation caps. `None` until the
+    /// `consumer_caps` request has been received (or forever for
+    /// legacy clients). The router pairs this with the bound
+    /// renderer's `format_caps` to compute a `NegotiatedScheme`.
+    consumer_caps: Option<crate::negotiate::PeerCaps>,
 }
 
 struct Inner {
@@ -308,6 +319,22 @@ impl Router {
                                 .on_renderer_frame(&rid, image_index, seq, release_point)
                                 .await;
                         }
+                        Ok(EventMsg::FormatCaps { .. }) => {
+                            // Renderer just shipped its
+                            // modifier-negotiation caps. Trigger
+                            // reconcile so the picker can run for any
+                            // already-registered displays — without
+                            // this, a display that registered before
+                            // the caps arrived would never see a
+                            // NegotiateBuffers dispatch.
+                            router.reconcile_buffer_flags().await;
+                        }
+                        Ok(EventMsg::BindFailed { fourcc, modifier, .. }) => {
+                            // Iter 5: renderer rejected the picked
+                            // (fourcc, modifier). Blacklist it on
+                            // the producer side and re-pick.
+                            router.on_renderer_bind_failed(&rid, fourcc, modifier).await;
+                        }
                         Ok(_) => {}
                         Err(RecvError::Closed) => {
                             log::info!("router: renderer {rid} broadcast closed");
@@ -384,6 +411,7 @@ impl Router {
                     tx,
                     last_renderer: None,
                     last_buffer_generation: None,
+                    consumer_caps: reg.consumer_caps,
                 },
             );
             // Phase 1 policy: auto-link to whichever renderer is "first".
@@ -410,6 +438,81 @@ impl Router {
         self.reconcile_lifecycle().await;
         self.reconcile_buffer_flags().await;
         self.emit(RouterEvent::DisplayRemoved(display_id));
+    }
+
+    /// Stash the consumer's modifier-negotiation caps on the
+    /// display's state and re-run the picker. Idempotent — a later
+    /// `ConsumerCaps` overrides the prior one.
+    pub async fn set_consumer_caps(
+        self: &Arc<Self>,
+        display_id: DisplayId,
+        caps: crate::negotiate::PeerCaps,
+    ) {
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(s) = inner.displays.get_mut(&display_id) {
+                s.consumer_caps = Some(caps);
+            } else {
+                return;
+            }
+        }
+        self.reconcile_buffer_flags().await;
+    }
+
+    /// Iter 5: consumer reported a `bind_failed` for `(fourcc, modifier)`.
+    /// Add the pair to this consumer's blacklist on its
+    /// [`crate::negotiate::PeerCaps`] and re-run the picker so the
+    /// daemon dispatches a fallback scheme. No-op for legacy
+    /// consumers that never sent `consumer_caps` (they have nowhere
+    /// to put a blacklist).
+    pub async fn on_consumer_bind_failed(
+        self: &Arc<Self>,
+        display_id: DisplayId,
+        fourcc: u32,
+        modifier: u64,
+    ) {
+        let inserted = {
+            let mut inner = self.inner.lock().await;
+            let Some(state) = inner.displays.get_mut(&display_id) else {
+                return;
+            };
+            let Some(caps) = state.consumer_caps.as_mut() else {
+                return;
+            };
+            caps.blacklist.insert((fourcc, modifier))
+        };
+        if inserted {
+            log::info!(
+                "router: display {display_id}: blacklisted (0x{fourcc:08x}, 0x{modifier:x}) — re-running picker"
+            );
+        }
+        self.reconcile_buffer_flags().await;
+    }
+
+    /// Iter 5: renderer reported a `bind_failed` for `(fourcc, modifier)`.
+    /// Add the pair to this producer's blacklist on its
+    /// [`crate::negotiate::PeerCaps`] and re-run the picker so the
+    /// daemon dispatches a fallback scheme. No-op for legacy
+    /// producers that never sent `format_caps`.
+    pub async fn on_renderer_bind_failed(
+        self: &Arc<Self>,
+        renderer_id: &str,
+        fourcc: u32,
+        modifier: u64,
+    ) {
+        let inserted = {
+            let inner = self.inner.lock().await;
+            let Some(renderer) = inner.table.get_renderer(renderer_id) else {
+                return;
+            };
+            renderer.blacklist_format(fourcc, modifier)
+        };
+        if inserted {
+            log::info!(
+                "router: renderer {renderer_id}: blacklisted (0x{fourcc:08x}, 0x{modifier:x}) — re-running picker"
+            );
+        }
+        self.reconcile_buffer_flags().await;
     }
 
     pub async fn update_display_size(
@@ -798,6 +901,14 @@ impl Router {
         // so we can pre-compute fan-out width — the reaper needs it to
         // know how many consumer FrameRecords to wait for at this
         // `release_point` before TRANSFERing.
+        //
+        // The `last_buffer_generation == Some(gen)` clause is what
+        // primarily holds frames back during a v2 renegotiation — the
+        // gate in `sync_display` prevents a Bind being pushed until
+        // `bind_snapshot` matches the dispatched scheme, so
+        // `last_buffer_generation` stays on the prior gen until the
+        // gate opens and a fresh Bind goes out. Once the gate opens
+        // both fields converge and frames flow.
         let recipients: Vec<&DisplayState> = inner
             .table
             .links_for_renderer(renderer_id)
@@ -884,39 +995,40 @@ impl Router {
         }
     }
 
-    /// Recompute per-renderer dmabuf placement flags. For each renderer
-    /// that has a snapshot (i.e. has bound buffers at least once) and
-    /// has no in-flight reconfigure, decide whether any currently
-    /// enabled consumer is on a different GPU; if so the buffer pool
-    /// must be HOST_VISIBLE (GTT) so it can be PRIME-imported. If not,
-    /// the renderer is free to use DEVICE_LOCAL (VRAM) for zero-copy.
-    /// When the desired flag set differs from the snapshot's flags,
-    /// dispatch a `ConfigureBuffers` and let `pending_configure` keep
-    /// any second call coalesced. Call after any topology mutation
-    /// (display add/remove, link change, renderer bind).
+    /// Re-run the modifier picker for every (renderer, display) link
+    /// the router knows about. Iter 2 dispatch policy: this is
+    /// observation-only — it logs the chosen scheme (or the reason a
+    /// pick failed) but does NOT yet send `negotiate_buffers` to
+    /// renderers. Iter 3 wires the dispatch.
+    ///
+    /// Pairs where either side hasn't yet shipped its caps are
+    /// skipped silently (legacy v1 path). Once Iter 2 lands the
+    /// producer/consumer probes, every pair will go through
+    /// `negotiate::pick`.
+    ///
+    /// Call after any topology mutation (display add/remove, link
+    /// change, renderer bind, caps update).
     async fn reconcile_buffer_flags(self: &Arc<Self>) {
-        let actions: Vec<(RendererId, u32)> = {
+        // Snapshot under the inner lock: (rid, did, producer_caps,
+        // consumer_caps, extent). pick() is pure, so we run it
+        // outside the lock to keep the critical section small.
+        struct Pair {
+            rid: RendererId,
+            did: DisplayId,
+            producer: crate::negotiate::PeerCaps,
+            consumer: crate::negotiate::PeerCaps,
+            extent: (u32, u32),
+        }
+        let pairs: Vec<Pair> = {
             let inner = self.inner.lock().await;
             let mut out = Vec::new();
             for rid in inner.table.renderer_ids() {
                 let Some(renderer) = inner.table.get_renderer(&rid) else {
                     continue;
                 };
-                if renderer.pending_configure().is_some() {
-                    continue;
-                }
-                // Skip until the renderer has produced its first bind.
-                let current_flags = match renderer
-                    .bind_snapshot()
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().map(|s| s.flags))
-                {
-                    Some(f) => f,
-                    None => continue,
+                let Some(producer_caps) = renderer.format_caps() else {
+                    continue; // legacy renderer — skip silently
                 };
-                let renderer_gpu = renderer.gpu;
-                let mut desired: u32 = 0;
                 for link in inner.table.links_for_renderer(&rid) {
                     if !link.enabled {
                         continue;
@@ -924,41 +1036,67 @@ impl Router {
                     let Some(state) = inner.displays.get(&link.display_id) else {
                         continue;
                     };
-                    // Either side reporting UNKNOWN forces the conservative
-                    // host-visible path; otherwise compare render nodes.
-                    let cross_gpu = !renderer_gpu.is_known()
-                        || !state.gpu.is_known()
-                        || renderer_gpu != state.gpu;
-                    if cross_gpu {
-                        desired |= BUF_HOST_VISIBLE;
-                    }
-                }
-                if desired != current_flags {
-                    out.push((rid, desired));
+                    let Some(consumer_caps) = state.consumer_caps.clone() else {
+                        continue; // legacy consumer — skip silently
+                    };
+                    out.push(Pair {
+                        rid: rid.clone(),
+                        did: link.display_id,
+                        producer: producer_caps.clone(),
+                        consumer: consumer_caps,
+                        extent: (state.info.width, state.info.height),
+                    });
                 }
             }
             out
         };
-        for (rid, flags) in actions {
-            // ConfigureBuffers dispatch is PAUSED while the release_syncobj
-            // plumbing is being shaken out — re-binding mid-stream throws
-            // off the per-frame syncobj bookkeeping (each new generation
-            // resets pending_release_fds and the producer's
-            // last_release_point, exposing edge-case races between
-            // rebuild → re-emit bind_buffers → first frame_ready of the
-            // new generation). Log what we would have sent so the
-            // routing decision is still visible. Re-enable by restoring
-            // the `send_configure_buffers` call below.
-            log::info!(
-                "router: renderer {rid} buffer_flags transition → 0x{flags:x} \
-                 (PAUSED — dispatch suppressed)"
-            );
-            // if let Err(e) = self.mgr.send_configure_buffers(&rid, flags).await {
-            //     log::warn!(
-            //         "router: configure_buffers {rid} flags=0x{flags:x}: {e}"
-            //     );
-            // }
-            let _ = (&self.mgr, flags);
+        // Iter 3a: dispatch the picked scheme via NegotiateBuffers.
+        // For multi-display fan-out the picker still runs per (renderer,
+        // display) pair, but we only want to dispatch ONCE per renderer
+        // per reconcile pass — collapse pairs by renderer, picking the
+        // most-recently-computed scheme. (TODO: when fan-out picks
+        // diverge, the daemon should pick the most restrictive scheme
+        // covering all consumers; for the prototype "last write wins"
+        // is fine because layer-shell + waywallen-display lib advertise
+        // identical hardcoded LINEAR caps.)
+        let mut by_renderer: std::collections::HashMap<RendererId, crate::negotiate::NegotiatedScheme> =
+            std::collections::HashMap::new();
+        for p in pairs {
+            match crate::negotiate::pick(&p.producer, &p.consumer, p.extent) {
+                Ok(scheme) => {
+                    log::info!(
+                        "router: pick({rid}, display {did}) = \
+                         fourcc=0x{fourcc:08x} modifier=0x{modifier:x} \
+                         plane_count={pc} sync=0x{sync:x} color=0x{color:x} \
+                         mem_hint=0x{mem:x} extent={w}x{h} count={count}",
+                        rid = p.rid,
+                        did = p.did,
+                        fourcc = scheme.fourcc,
+                        modifier = scheme.modifier,
+                        pc = scheme.plane_count,
+                        sync = scheme.sync_mode,
+                        color = scheme.color,
+                        mem = scheme.mem_hint,
+                        w = scheme.extent.0,
+                        h = scheme.extent.1,
+                        count = scheme.count,
+                    );
+                    by_renderer.insert(p.rid.clone(), scheme);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "router: pick({rid}, display {did}) failed: {e:?}",
+                        rid = p.rid,
+                        did = p.did,
+                    );
+                }
+            }
+        }
+        // Outside the inner lock — send_negotiate_buffers takes its own.
+        for (rid, scheme) in by_renderer {
+            if let Err(e) = self.mgr.send_negotiate_buffers(&rid, scheme).await {
+                log::warn!("router: NegotiateBuffers {rid}: {e}");
+            }
         }
     }
 
@@ -987,6 +1125,33 @@ impl Router {
                     .and_then(|g| g.as_ref().map(|s| s.generation))?;
                 Some((l, renderer, gen))
             });
+
+        // Modifier-negotiation gate (Iter 3 step 1): when both producer
+        // and consumer ship v2 caps, the renderer's bind_snapshot must
+        // match the daemon's last-dispatched `NegotiatedScheme` before
+        // a Bind is fanned out. Frames are silently held back until
+        // the renderer answers `negotiate_buffers` with a matching
+        // `bind_buffers`.
+        //
+        // Skipping is conservative: we leave `last_renderer` /
+        // `last_buffer_generation` untouched so the consumer keeps its
+        // previous bind on screen rather than getting an Unbind during
+        // the brief renegotiation window. The follow-up call from
+        // `on_renderer_bind` (when the matching snapshot arrives)
+        // re-enters this function with the gate open and finishes the
+        // transition.
+        if let Some((_, ref renderer, _)) = target {
+            let state = inner.displays.get(&display_id).unwrap();
+            let v2_both = renderer.format_caps().is_some() && state.consumer_caps.is_some();
+            if v2_both && !renderer.scheme_satisfied() {
+                log::debug!(
+                    "router: sync_display({display_id}) gated — renderer {} \
+                     bind_snapshot does not yet match last-dispatched scheme",
+                    renderer.id
+                );
+                return;
+            }
+        }
 
         // Snapshot what was last sent.
         let (last_renderer, last_gen, info) = {
@@ -1085,6 +1250,7 @@ mod tests {
             refresh_mhz: 60_000,
             gpu: DrmNode::UNKNOWN,
             properties: vec![],
+            consumer_caps: None,
         }
     }
 
@@ -1353,5 +1519,158 @@ mod tests {
             }
         }
         assert!(saw_paused, "expected R1 Paused upsert after display unregister");
+    }
+
+    // -----------------------------------------------------------------
+    // Iter 5 — bind_failed + per-peer blacklist + retry
+    // -----------------------------------------------------------------
+
+    /// Build a single-fourcc PeerCaps with the given (modifier,plane_count) list.
+    /// Mirrors `negotiate::tests::caps_one_fourcc` but in scope here.
+    fn build_caps(
+        fourcc: u32,
+        mods: &[(u64, u32)],
+        uuid_byte: u8,
+    ) -> crate::negotiate::PeerCaps {
+        use crate::negotiate as N;
+        let mod_count = mods.len() as u32;
+        let modifiers: Vec<u64> = mods.iter().map(|(m, _)| *m).collect();
+        let plane_counts: Vec<u32> = mods.iter().map(|(_, p)| *p).collect();
+        let usages: Vec<u32> = vec![N::USAGE_SAMPLED; mods.len()];
+        let dev_words = [u32::from_le_bytes([uuid_byte; 4]); 4];
+        let drv_words = [u32::from_le_bytes([uuid_byte; 4]); 4];
+        N::unflatten_caps(
+            &[fourcc],
+            &[mod_count],
+            &modifiers,
+            &usages,
+            &plane_counts,
+            &dev_words,
+            &drv_words,
+            DrmNode { major: 226, minor: 128 },
+            N::SYNC_SYNCOBJ_TIMELINE,
+            N::DEFAULT_COLOR,
+            N::MEM_HINT_HOST_VISIBLE,
+            (1920, 1080),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consumer_bind_failed_inserts_blacklist() {
+        // Wire a v2 consumer + producer, then push a BindFailed via
+        // the router. The display's consumer_caps blacklist must
+        // grow by one entry; reconcile_buffer_flags is called as a
+        // side effect (we don't observe it directly here — covered
+        // by the next test).
+        use crate::negotiate as N;
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        add_stub_renderer(&mgr, &router, "R1").await;
+        let h = router.register_display(reg("D1", 1920, 1080)).await;
+
+        let caps = build_caps(N::DRM_FORMAT_ABGR8888, &[(N::DRM_FORMAT_MOD_LINEAR, 1)], 0xAA);
+        router.set_consumer_caps(h.id, caps).await;
+
+        let nl: u64 = 0x0100_0000_0000_0001;
+        router.on_consumer_bind_failed(h.id, N::DRM_FORMAT_ABGR8888, nl).await;
+
+        let inner = router.inner.lock().await;
+        let state = inner.displays.get(&h.id).unwrap();
+        let bl = &state.consumer_caps.as_ref().unwrap().blacklist;
+        assert!(bl.contains(&(N::DRM_FORMAT_ABGR8888, nl)));
+    }
+
+    #[tokio::test]
+    async fn renderer_bind_failed_inserts_blacklist() {
+        // Same shape as the consumer test, but on the producer side.
+        use crate::negotiate as N;
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let h = RendererHandle::test_stub("R1", "scene");
+        let nl: u64 = 0x0100_0000_0000_0001;
+        h.test_set_format_caps(build_caps(
+            N::DRM_FORMAT_ABGR8888,
+            &[(N::DRM_FORMAT_MOD_LINEAR, 1), (nl, 1)],
+            0xAA,
+        ));
+        mgr.register_test_handle(h.clone()).await;
+        router.register_renderer(h.clone()).await;
+
+        assert_eq!(h.test_blacklist_len(), 0);
+        router.on_renderer_bind_failed("R1", N::DRM_FORMAT_ABGR8888, nl).await;
+        assert_eq!(h.test_blacklist_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn picker_falls_back_after_consumer_blacklist() {
+        // End-to-end: producer + consumer both advertise LINEAR + a
+        // non-LINEAR modifier with a matching device UUID, so the
+        // picker prefers non-LINEAR. Simulate the consumer rejecting
+        // the non-LINEAR modifier; the picker must now fall back to
+        // LINEAR.
+        //
+        // We can't observe `last_dispatched_scheme` because the test
+        // stub's UnixStream peer end is closed (`_b` drops at the
+        // end of `test_stub`), so `send_negotiate_buffers` returns
+        // EPIPE and never records the scheme. Instead, drive the
+        // picker directly with the post-mutation peer caps — that
+        // proves the blacklist mutation reached the right `PeerCaps`.
+        use crate::negotiate as N;
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+
+        let nl: u64 = 0x0100_0000_0000_0001;
+        let h = RendererHandle::test_stub("R1", "scene");
+        h.test_set_format_caps(build_caps(
+            N::DRM_FORMAT_ABGR8888,
+            &[(N::DRM_FORMAT_MOD_LINEAR, 1), (nl, 1)],
+            0xAA,
+        ));
+        mgr.register_test_handle(h.clone()).await;
+        router.register_renderer(h.clone()).await;
+
+        let dh = router.register_display(reg("D1", 1920, 1080)).await;
+        router
+            .set_consumer_caps(
+                dh.id,
+                build_caps(
+                    N::DRM_FORMAT_ABGR8888,
+                    &[(N::DRM_FORMAT_MOD_LINEAR, 1), (nl, 1)],
+                    0xAA,
+                ),
+            )
+            .await;
+
+        // Pre-blacklist pick must land on the non-LINEAR (same-device preference).
+        {
+            let inner = router.inner.lock().await;
+            let prod = h.format_caps().expect("producer caps");
+            let cons = inner.displays[&dh.id]
+                .consumer_caps
+                .clone()
+                .expect("consumer caps");
+            let s = N::pick(&prod, &cons, (1920, 1080)).expect("pick ok");
+            assert_eq!(s.modifier, nl, "pre-blacklist must prefer non-LINEAR");
+        }
+
+        // Consumer reports the non-LINEAR is unimportable.
+        router
+            .on_consumer_bind_failed(dh.id, N::DRM_FORMAT_ABGR8888, nl)
+            .await;
+
+        // Post-blacklist pick must fall back to LINEAR.
+        let inner = router.inner.lock().await;
+        let prod = h.format_caps().expect("producer caps");
+        let cons = inner.displays[&dh.id]
+            .consumer_caps
+            .clone()
+            .expect("consumer caps");
+        let s = N::pick(&prod, &cons, (1920, 1080)).expect("post-blacklist pick ok");
+        assert_eq!(
+            s.modifier,
+            N::DRM_FORMAT_MOD_LINEAR,
+            "after consumer blacklist, picker must fall back to LINEAR"
+        );
     }
 }

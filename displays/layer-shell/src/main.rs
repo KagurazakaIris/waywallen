@@ -1,6 +1,6 @@
 //! waywallen-display-layer-shell — Wayland layer-shell wallpaper client.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -154,6 +154,13 @@ struct OutputBinding {
     /// when the compositor releases a specific slot. Vec is grown to
     /// `count` when `bind_buffers` arrives.
     pending_release_fds: Mutex<Vec<VecDeque<OwnedFd>>>,
+    /// Live (fourcc → set of modifier) view of what the wlroots
+    /// compositor advertised over `zwp_linux_dmabuf_v1` v3
+    /// `format`/`modifier` events. Shared with the main thread; the
+    /// worker reads a snapshot when it sends `consumer_caps`. We
+    /// don't subscribe to feedback v4 yet — v3 broadcasts the full
+    /// table on bind, which is delivered before we open a UDS.
+    dmabuf_caps: Arc<Mutex<BTreeMap<u32, BTreeSet<u64>>>>,
 }
 
 /// One logical output — wl_output plus the layer_surface/UDS worker
@@ -185,6 +192,12 @@ struct App {
     outputs: HashMap<u32, OutputEntry>,
     uds_sock: PathBuf,
     name_prefix: String,
+    /// (fourcc → modifier set) accumulated from
+    /// `zwp_linux_dmabuf_v1` v3 `format`/`modifier` events. Shared
+    /// with every `OutputBinding` so worker threads encode the
+    /// compositor's actual modifier set into `consumer_caps` instead
+    /// of a hardcoded LINEAR-only fallback.
+    dmabuf_caps: Arc<Mutex<BTreeMap<u32, BTreeSet<u64>>>>,
 }
 
 impl App {
@@ -197,6 +210,7 @@ impl App {
             outputs: HashMap::new(),
             uds_sock,
             name_prefix,
+            dmabuf_caps: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -529,6 +543,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for App {
                         stream: RwLock::new(None),
                         frame_pending: AtomicBool::new(false),
                         pending_release_fds: Mutex::new(Vec::new()),
+                        dmabuf_caps: state.dmabuf_caps.clone(),
                     })
                 });
                 // `width` / `height` from `configure` are in *logical*
@@ -577,13 +592,41 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for App {
 
 impl Dispatch<ZwpLinuxDmabufV1, ()> for App {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _p: &ZwpLinuxDmabufV1,
-        _e: zwp_linux_dmabuf_v1::Event,
+        e: zwp_linux_dmabuf_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        // v3 advertises every (fourcc, modifier) the compositor
+        // accepts via two event streams:
+        //   - `format { format }` — a fourcc supported with implicit
+        //     modifier only.
+        //   - `modifier { format, modifier_hi, modifier_lo }` —
+        //     explicit modifier table; sent for every supported
+        //     (fourcc, modifier) including LINEAR.
+        // We accumulate both into `dmabuf_caps`. Implicit-only fourccs
+        // get a synthetic LINEAR entry so the modifier list is never
+        // empty for a fourcc the compositor mentioned at all.
+        match e {
+            zwp_linux_dmabuf_v1::Event::Format { format } => {
+                if let Ok(mut g) = state.dmabuf_caps.lock() {
+                    g.entry(format).or_default().insert(0 /* DRM_FORMAT_MOD_LINEAR */);
+                }
+            }
+            zwp_linux_dmabuf_v1::Event::Modifier {
+                format,
+                modifier_hi,
+                modifier_lo,
+            } => {
+                let modifier = ((modifier_hi as u64) << 32) | (modifier_lo as u64);
+                if let Ok(mut g) = state.dmabuf_caps.lock() {
+                    g.entry(format).or_default().insert(modifier);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -729,6 +772,95 @@ fn run_uds_session(sock: &Path, binding: &OutputBinding) -> Result<()> {
         (ProtoEvent::DisplayAccepted { display_id }, _) => display_id,
         (other, _) => bail!("expected display_accepted, got opcode {}", other.opcode()),
     };
+
+    // Modifier-negotiation v2 caps. layer-shell hands each dma-buf
+    // to the wayland compositor; the compositor imports on whatever
+    // GPU it owns, so the authoritative per-modifier feedback is
+    // what the compositor advertised over `zwp_linux_dmabuf_v1` v3.
+    // We snapshot the live (fourcc → modifier set) map captured by
+    // the App's dmabuf Dispatch impl and forward the whole thing.
+    //
+    // Empty map means the compositor exposed dmabuf v3 but never
+    // delivered any format/modifier event — extremely unusual but
+    // possible if the roundtrip ordering misses them. Fall back to
+    // the legacy ABGR/XRGB + LINEAR pair so the daemon still has a
+    // viable cross-vendor scheme.
+    //
+    // device_uuid stays zeros; the picker falls back to the DRM node
+    // (also zero — see register_display above), so this consumer is
+    // treated as "unknown device" and forces HOST_VISIBLE on every
+    // renderer. Wlroots dmabuf-feedback v4 would expose a main_device
+    // we could thread through here — left as a follow-up.
+    {
+        use waywallen::negotiate as N;
+        let snapshot: Vec<(u32, Vec<u64>)> = {
+            let guard = binding.dmabuf_caps.lock().unwrap();
+            guard
+                .iter()
+                .map(|(fourcc, mods)| (*fourcc, mods.iter().copied().collect::<Vec<u64>>()))
+                .collect()
+        };
+        let (fourccs, mod_counts, modifiers, usages, plane_counts) =
+            if snapshot.is_empty() {
+                log::warn!(
+                    "[{}] zwp_linux_dmabuf_v1 exposed no formats — \
+                     falling back to ABGR/XRGB + LINEAR consumer_caps",
+                    binding.display_name
+                );
+                (
+                    vec![N::DRM_FORMAT_ABGR8888, N::DRM_FORMAT_XRGB8888],
+                    vec![1u32, 1],
+                    vec![N::DRM_FORMAT_MOD_LINEAR, N::DRM_FORMAT_MOD_LINEAR],
+                    vec![N::USAGE_SAMPLED, N::USAGE_SAMPLED],
+                    vec![1u32, 1],
+                )
+            } else {
+                let mut fourccs: Vec<u32> = Vec::with_capacity(snapshot.len());
+                let mut mod_counts: Vec<u32> = Vec::with_capacity(snapshot.len());
+                let total_mods: usize = snapshot.iter().map(|(_, m)| m.len()).sum();
+                let mut modifiers: Vec<u64> = Vec::with_capacity(total_mods);
+                let mut usages: Vec<u32> = Vec::with_capacity(total_mods);
+                let mut plane_counts: Vec<u32> = Vec::with_capacity(total_mods);
+                for (fourcc, mods) in &snapshot {
+                    fourccs.push(*fourcc);
+                    mod_counts.push(mods.len() as u32);
+                    for m in mods {
+                        modifiers.push(*m);
+                        usages.push(N::USAGE_SAMPLED);
+                        plane_counts.push(1);
+                    }
+                }
+                log::info!(
+                    "[{}] consumer_caps: {} fourccs, {} (fourcc,modifier) entries from compositor",
+                    binding.display_name,
+                    fourccs.len(),
+                    modifiers.len()
+                );
+                (fourccs, mod_counts, modifiers, usages, plane_counts)
+            };
+        codec::send_request(
+            &stream,
+            &ProtoRequest::ConsumerCaps {
+                fourccs,
+                mod_counts,
+                modifiers,
+                usages,
+                plane_counts,
+                device_uuid: vec![0, 0, 0, 0],
+                driver_uuid: vec![0, 0, 0, 0],
+                drm_render_major: 0,
+                drm_render_minor: 0,
+                mem_hints: N::MEM_HINT_HOST_VISIBLE,
+                sync_caps: N::SYNC_SYNCOBJ_TIMELINE | N::SYNC_SYNCOBJ_BINARY,
+                color_caps: N::DEFAULT_COLOR,
+                extent_max_w: 7680,
+                extent_max_h: 4320,
+            },
+            &[],
+        )
+        .map_err(|e| anyhow!("send consumer_caps: {e}"))?;
+    }
+
     log::info!(
         "[{}] registered as display_id={display_id} ({width}x{height})",
         binding.display_name

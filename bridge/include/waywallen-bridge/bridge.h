@@ -23,6 +23,8 @@
 #define WAYWALLEN_BRIDGE_H
 
 #include <waywallen-bridge/ipc_v1.h>
+#include <waywallen-bridge/drm_fourcc.h>
+#include <waywallen-bridge/protocol_bits.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -116,8 +118,97 @@ int ww_bridge_send_frame_ready(int sock,
  * after this call returns (the kernel dup'd it into SCM_RIGHTS). */
 int ww_bridge_send_release_syncobj(int sock, int release_syncobj_fd);
 
+/* Emit `FormatCaps` — the producer's modifier-negotiation declaration.
+ * Send exactly once per connection, after `Ready` and before any
+ * `BindBuffers`. Caller fills the parallel-array fields directly on
+ * `m`; this helper is a thin encode + framed-send wrapper.
+ *
+ * Validation invariant (mirrored on the daemon side):
+ *   m->modifiers.count == m->usages.count == m->plane_counts.count ==
+ *   sum(m->mod_counts.data[0..fourccs.count])
+ * The helper does NOT enforce this — the renderer must construct the
+ * arrays consistently or the daemon's unflatten_caps will reject. */
+int ww_bridge_send_format_caps(int sock, const ww_evt_format_caps_t *m);
+
+/* Caller-friendly inputs for `ww_bridge_send_format_caps_v2`. Holds
+ * pointers to caller-owned arrays (no copies, no ownership transfer)
+ * plus the scalar negotiation knobs. The helper assembles the
+ * `ww_evt_format_caps_t` wire shape from these fields, packs the two
+ * 16-byte UUIDs as 4×u32 LE, and dispatches to
+ * `ww_bridge_send_format_caps`.
+ *
+ * Length invariants (mirrored on the daemon's `unflatten_caps`):
+ *   modifiers_count == usages_count == plane_counts_count ==
+ *   sum(mod_counts[0..fourccs_count])
+ *
+ * `device_uuid` / `driver_uuid`: pass NULL to send 16 zero bytes
+ * (renderers without `VK_KHR_external_memory_capabilities` /
+ * EGL_DEVICE_UUID_EXT do this). When non-NULL, must point at 16
+ * readable bytes. */
+typedef struct ww_format_caps_caller {
+    const uint32_t *fourccs;        uint32_t fourccs_count;
+    const uint32_t *mod_counts;     uint32_t mod_counts_count;
+    const uint64_t *modifiers;      uint32_t modifiers_count;
+    const uint32_t *usages;         uint32_t usages_count;
+    const uint32_t *plane_counts;   uint32_t plane_counts_count;
+    const uint8_t  *device_uuid;    /* NULL or 16 bytes */
+    const uint8_t  *driver_uuid;    /* NULL or 16 bytes */
+    uint32_t        drm_render_major;
+    uint32_t        drm_render_minor;
+    uint32_t        mem_hints;
+    uint32_t        sync_caps;
+    uint32_t        color_caps;
+    uint32_t        extent_max_w;
+    uint32_t        extent_max_h;
+} ww_format_caps_caller_t;
+
+/* High-level wrapper around `ww_bridge_send_format_caps` that takes
+ * caller-owned C arrays and the negotiation scalars in one struct.
+ * Use this when assembling format caps from a probe loop — both
+ * renderer plugins go through this path. */
+int ww_bridge_send_format_caps_v2(int sock,
+                                  const ww_format_caps_caller_t *m);
+
+/* Emit `BindFailed` — non-terminal report that the renderer could not
+ * satisfy a `negotiate_buffers` request. Daemon blacklists the
+ * (fourcc, modifier) pair on this renderer and re-runs the picker. */
+int ww_bridge_send_bind_failed(int sock,
+                               uint32_t fourcc,
+                               uint64_t modifier,
+                               uint32_t reason,
+                               const char *message);
+
 /* Emit an `Error` event with a text message. */
 int ww_bridge_send_error(int sock, const char *msg);
+
+
+/* -----------------------------------------------------------------------
+ * Diagnostics
+ * ----------------------------------------------------------------------- */
+
+/* One labeled row of the GPU info block. Both fields are
+ * caller-owned, NUL-terminated. `value == NULL` is rendered as
+ * "(null)" — useful when an EGL/Vulkan/GL string accessor returns
+ * NULL. `label == NULL` is treated as the empty string. */
+typedef struct ww_gpu_info_field {
+    const char *label;
+    const char *value;
+} ww_gpu_info_field_t;
+
+/* Print a "GPU info" diagnostic block to stderr, formatted as
+ *
+ *     {prefix}: GPU info
+ *       {label}: {value}
+ *       ...
+ *
+ * The label column auto-aligns to the widest label across all
+ * supplied fields. Caller does the GPU-API queries (eglQueryString,
+ * glGetString, vkGetPhysicalDeviceProperties ...) and hands the
+ * already-fetched strings to this helper, so the bridge stays free
+ * of any EGL/GL/Vulkan dependency. */
+void ww_bridge_log_gpu_info(const char *prefix,
+                            const ww_gpu_info_field_t *fields,
+                            size_t n_fields);
 
 
 /* -----------------------------------------------------------------------
@@ -137,7 +228,7 @@ typedef struct ww_bridge_control {
         ww_req_mouse_t              mouse;
         ww_req_set_fps_t            set_fps;
         ww_req_shutdown_t           shutdown;
-        ww_req_configure_buffers_t  configure_buffers;
+        ww_req_negotiate_buffers_t  negotiate_buffers;
     } u;
 } ww_bridge_control_t;
 

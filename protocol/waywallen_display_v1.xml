@@ -58,13 +58,27 @@
     - Display never panics/aborts; any wire or protocol error results
       in on_disconnected and cleanup. Server is free to crash.
 
-  Version: 1
+  Version: 2
+
+  v2 (modifier negotiation):
+    - Consumer ships `consumer_caps` request immediately after
+      `register_display`. Carries fourcc/modifier/usage/plane_count
+      grids plus device_uuid + sync_caps + color_caps + mem_hints
+      mirroring the producer-side `format_caps` event in ipc_v2.
+    - Daemon pairs the consumer's caps with the bound renderer's caps,
+      picks an intersection (LINEAR cross-vendor / non-LINEAR same-GPU)
+      and only THEN dispatches `bind_buffers` for this consumer.
+    - Consumer sends `bind_failed` request on import failure; daemon
+      blacklists that (fourcc, modifier) pair on this consumer and
+      retries the picker. Non-terminal — only `error` is terminal.
+
   Required features (must appear in welcome.features):
-    "explicit_sync_fd"   — acquire fence carried as dma_fence sync_file.
-    "drm_syncobj_release" — release fence carried as drm_syncobj fd.
+    "explicit_sync_fd"           — acquire fence as dma_fence sync_file.
+    "drm_syncobj_release"        — release fence as drm_syncobj fd.
+    "modifier_negotiation_v1"    — consumer_caps + bind_failed plumbing.
   Optional features (reserved): "color_management", "hdr"
 -->
-<protocol name="waywallen_display" version="1">
+<protocol name="waywallen_display" version="2">
 
   <!-- ==================================================================
        REQUESTS  (display -> manager)
@@ -142,6 +156,50 @@
     events until the server closes the socket.
   -->
   <request name="bye" opcode="5">
+  </request>
+
+  <!--
+    Consumer capability declaration — sent immediately after
+    `register_display`. Mirrors `format_caps` in waywallen-ipc-v2;
+    same parallel-array layout, same bit definitions for usage /
+    sync_caps / color_caps / mem_hints. The daemon stores it
+    alongside the renderer's caps and gates `bind_buffers` dispatch
+    on a successful `negotiate::pick(producer, consumer)`.
+
+    Encoding: see waywallen-ipc-v2 `format_caps` doc. Validation:
+    modifiers.len == usages.len == plane_counts.len == sum(mod_counts).
+  -->
+  <request name="consumer_caps" opcode="6">
+    <arg name="fourccs" type="array" element="u32"/>
+    <arg name="mod_counts" type="array" element="u32"/>
+    <arg name="modifiers" type="array" element="u64"/>
+    <arg name="usages" type="array" element="u32"/>
+    <arg name="plane_counts" type="array" element="u32"/>
+    <arg name="device_uuid" type="array" element="u32"/>
+    <arg name="driver_uuid" type="array" element="u32"/>
+    <arg name="drm_render_major" type="u32"/>
+    <arg name="drm_render_minor" type="u32"/>
+    <arg name="mem_hints" type="u32"/>
+    <arg name="sync_caps" type="u32"/>
+    <arg name="color_caps" type="u32"/>
+    <arg name="extent_max_w" type="u32"/>
+    <arg name="extent_max_h" type="u32"/>
+  </request>
+
+  <!--
+    Consumer report that a daemon-issued `bind_buffers` could not be
+    imported on this device (e.g. `eglCreateImageKHR` returned
+    EGL_NO_IMAGE_KHR for the (fourcc, modifier) pair the daemon picked).
+    Non-terminal: the daemon adds (fourcc, modifier) to this consumer's
+    per-peer blacklist and re-runs `negotiate::pick`. If the picker
+    has nothing left it falls back to a terminal `error` event.
+    `reason` codes mirror ipc-v2 bind_failed.
+  -->
+  <request name="bind_failed" opcode="7">
+    <arg name="fourcc" type="u32"/>
+    <arg name="modifier" type="u64"/>
+    <arg name="reason" type="u32"/>
+    <arg name="message" type="string"/>
   </request>
 
 

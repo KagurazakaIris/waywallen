@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -321,11 +322,96 @@ int ww_bridge_send_release_syncobj(int sock, int release_syncobj_fd) {
                   ww_evt_release_syncobj_encode, &m, &release_syncobj_fd, 1);
 }
 
+int ww_bridge_send_format_caps(int sock, const ww_evt_format_caps_t *m) {
+    if (!m) return -EINVAL;
+    WW_SEND_EVENT(sock, WW_EVT_FORMAT_CAPS, ww_evt_format_caps_encode,
+                  m, NULL, 0);
+}
+
+int ww_bridge_send_format_caps_v2(int sock,
+                                  const ww_format_caps_caller_t *m) {
+    if (!m) return -EINVAL;
+
+    /* Pack the two 16-byte UUIDs as 4 LE u32s each. memcpy preserves
+     * byte order so on little-endian Linux the wire bytes are
+     * identical to the input. NULL → 16 zero bytes. */
+    uint32_t dev_uuid_w[4] = { 0, 0, 0, 0 };
+    uint32_t drv_uuid_w[4] = { 0, 0, 0, 0 };
+    if (m->device_uuid) memcpy(dev_uuid_w, m->device_uuid, 16);
+    if (m->driver_uuid) memcpy(drv_uuid_w, m->driver_uuid, 16);
+
+    ww_evt_format_caps_t e;
+    memset(&e, 0, sizeof(e));
+    e.fourccs.count       = m->fourccs_count;
+    e.fourccs.data        = (uint32_t *)m->fourccs;
+    e.mod_counts.count    = m->mod_counts_count;
+    e.mod_counts.data     = (uint32_t *)m->mod_counts;
+    e.modifiers.count     = m->modifiers_count;
+    e.modifiers.data      = (uint64_t *)m->modifiers;
+    e.usages.count        = m->usages_count;
+    e.usages.data         = (uint32_t *)m->usages;
+    e.plane_counts.count  = m->plane_counts_count;
+    e.plane_counts.data   = (uint32_t *)m->plane_counts;
+    e.device_uuid.count   = 4;
+    e.device_uuid.data    = dev_uuid_w;
+    e.driver_uuid.count   = 4;
+    e.driver_uuid.data    = drv_uuid_w;
+    e.drm_render_major    = m->drm_render_major;
+    e.drm_render_minor    = m->drm_render_minor;
+    e.mem_hints           = m->mem_hints;
+    e.sync_caps           = m->sync_caps;
+    e.color_caps          = m->color_caps;
+    e.extent_max_w        = m->extent_max_w;
+    e.extent_max_h        = m->extent_max_h;
+    return ww_bridge_send_format_caps(sock, &e);
+}
+
+int ww_bridge_send_bind_failed(int sock, uint32_t fourcc, uint64_t modifier,
+                               uint32_t reason, const char *message) {
+    ww_evt_bind_failed_t m;
+    memset(&m, 0, sizeof(m));
+    m.fourcc = fourcc;
+    m.modifier = modifier;
+    m.reason = reason;
+    m.message = (char *)(message ? message : "");
+    WW_SEND_EVENT(sock, WW_EVT_BIND_FAILED, ww_evt_bind_failed_encode,
+                  &m, NULL, 0);
+}
+
 int ww_bridge_send_error(int sock, const char *msg) {
     if (!msg) return -EINVAL;
     ww_evt_error_t m;
     m.msg = (char *)msg; /* encoder doesn't mutate */
     WW_SEND_EVENT(sock, WW_EVT_ERROR, ww_evt_error_encode, &m, NULL, 0);
+}
+
+
+/* -----------------------------------------------------------------------
+ * Diagnostics
+ * ----------------------------------------------------------------------- */
+
+void ww_bridge_log_gpu_info(const char *prefix,
+                            const ww_gpu_info_field_t *fields,
+                            size_t n_fields) {
+    if (!fields || n_fields == 0) return;
+
+    /* Pass 1: widest label. */
+    size_t max_label = 0;
+    for (size_t i = 0; i < n_fields; i++) {
+        const char *l = fields[i].label ? fields[i].label : "";
+        size_t len = strlen(l);
+        if (len > max_label) max_label = len;
+    }
+
+    fprintf(stderr, "%s: GPU info\n", prefix ? prefix : "");
+    /* Format: 2-space indent, label, colon, padding so values align,
+     * then the value. NULL value renders as "(null)". */
+    for (size_t i = 0; i < n_fields; i++) {
+        const char *lbl = fields[i].label ? fields[i].label : "";
+        const char *val = fields[i].value ? fields[i].value : "(null)";
+        int pad = (int)(max_label - strlen(lbl)) + 1;
+        fprintf(stderr, "  %s:%*s%s\n", lbl, pad, "", val);
+    }
 }
 
 
@@ -378,9 +464,9 @@ int ww_bridge_recv_control(int sock, ww_bridge_control_t *out) {
     case WW_REQ_SHUTDOWN:
         rc = ww_req_shutdown_decode(body, body_len, &out->u.shutdown);
         break;
-    case WW_REQ_CONFIGURE_BUFFERS:
-        rc = ww_req_configure_buffers_decode(body, body_len,
-                                             &out->u.configure_buffers);
+    case WW_REQ_NEGOTIATE_BUFFERS:
+        rc = ww_req_negotiate_buffers_decode(body, body_len,
+                                             &out->u.negotiate_buffers);
         break;
     default:
         rc = WW_ERR_UNKNOWN_OPCODE;
@@ -401,8 +487,8 @@ void ww_bridge_control_free(ww_bridge_control_t *msg) {
     case WW_REQ_MOUSE:      ww_req_mouse_free(&msg->u.mouse); break;
     case WW_REQ_SET_FPS:    ww_req_set_fps_free(&msg->u.set_fps); break;
     case WW_REQ_SHUTDOWN:   ww_req_shutdown_free(&msg->u.shutdown); break;
-    case WW_REQ_CONFIGURE_BUFFERS:
-        ww_req_configure_buffers_free(&msg->u.configure_buffers);
+    case WW_REQ_NEGOTIATE_BUFFERS:
+        ww_req_negotiate_buffers_free(&msg->u.negotiate_buffers);
         break;
     default: break;
     }

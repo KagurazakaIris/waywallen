@@ -15,6 +15,7 @@ mod events;
 mod ipc;
 mod media_probe;
 mod model;
+mod negotiate;
 mod playlist;
 mod plugin;
 mod probe_task;

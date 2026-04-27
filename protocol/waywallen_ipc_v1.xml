@@ -55,9 +55,26 @@
       `release_syncobj@release_point` before re-recording into the same
       `image_index`.
 
-  Version: 1
+  Version: 2
+
+  v2 (modifier negotiation):
+    - Renderer ships `format_caps` event after `ready` and before any
+      `bind_buffers`. Carries fourcc/modifier/usage/plane_count grids
+      plus device_uuid + sync_caps + color_caps + mem_hints. Daemon
+      pairs producer caps with consumer caps and picks a scheme.
+    - Daemon dispatches `negotiate_buffers` request — replacement for
+      `configure_buffers` — telling the renderer exactly which fourcc,
+      modifier, plane_count, sync_mode, color_space, mem_hint, extent
+      and pool size to allocate. The renderer answers with a fresh
+      `bind_buffers` whose fourcc + modifier match.
+    - Renderer replies with `bind_failed` event when it cannot satisfy
+      a `negotiate_buffers` (e.g. allocator refuses the modifier on
+      this device); daemon blacklists that (fourcc, modifier) pair on
+      the renderer and re-runs the picker.
+    - `configure_buffers` is retained for the Iter 1+2 transition but
+      is dispatch-paused in the daemon; Iter 3 deletes it outright.
 -->
-<protocol name="waywallen_ipc" version="1">
+<protocol name="waywallen_ipc" version="2">
 
   <!-- ==================================================================
        REQUESTS  (daemon -> subprocess, control plane)
@@ -107,27 +124,40 @@
   <request name="shutdown" opcode="7"/>
 
   <!--
-    Ask the subprocess to re-export its DMA-BUF pool with the requested
-    placement flags. The subprocess MUST eventually answer with a fresh
-    `bind_buffers` event that carries the same `flags` and a strictly
-    increasing `generation`; if the requested flags equal the current
-    flags the request is a no-op and may be ignored.
-
-    Flag bits (request and the matching `bind_buffers.flags`):
-      bit 0 = host_visible — back the dmabuf with HOST_VISIBLE memory
-              (typically GTT / system RAM). Required for cross-GPU PRIME
-              import when the consumer is on a different DRM render
-              node; otherwise foreign-GPU drivers fail validate with
-              -ENOMEM and lose their device on first submit.
-      bit 1.. — reserved, MUST be 0 in v1.
-
-    The daemon recomputes the desired flag set whenever the routing
-    topology changes (display attach/detach, link enable/disable) and
-    only emits this request when the desired set differs from the
-    snapshot's `flags` and no rebind is already in flight.
+    Opcode 8 was `configure_buffers` in v1; v2 deletes it in favor of
+    `negotiate_buffers` (opcode 9). The opcode value is reserved.
   -->
-  <request name="configure_buffers" opcode="8">
-    <arg name="flags" type="u32"/>
+
+  <!--
+    Modifier-negotiation v2 — replaces the deleted `configure_buffers`. The
+    daemon ships exactly the (fourcc, modifier, plane_count, sync_mode,
+    color, mem_hint, extent, count) tuple it picked from the producer ∩
+    consumer caps intersection. The renderer answers with a fresh
+    `bind_buffers` whose fourcc + modifier match (and a strictly
+    increasing `generation`). On failure the renderer sends
+    `bind_failed` (opcode 7); the daemon then blacklists the
+    (fourcc, modifier) pair on this renderer and tries again.
+
+    Field meanings:
+      `fourcc`        — DRM_FORMAT_* (canonical: ABGR8888 = 'AB24' = 0x34324241).
+      `modifier`      — DRM_FORMAT_MOD_* (LINEAR = 0; INVALID/0xff..ff = "implicit, allocator picks").
+      `plane_count`   — # planes for this fourcc/modifier combo (1 for RGBA).
+      `sync_mode`     — see `format_caps.sync_caps` bits below; exactly one bit.
+      `color`         — packed encoding/range/alpha; see `format_caps.color_caps`.
+      `mem_hint`      — bitfield: same bits as `format_caps.mem_hints`.
+      `extent_w/h`    — pixel extent of each buffer.
+      `count`         — pool size (number of buffers in the swapchain).
+  -->
+  <request name="negotiate_buffers" opcode="9">
+    <arg name="fourcc" type="u32"/>
+    <arg name="modifier" type="u64"/>
+    <arg name="plane_count" type="u32"/>
+    <arg name="sync_mode" type="u32"/>
+    <arg name="color" type="u32"/>
+    <arg name="mem_hint" type="u32"/>
+    <arg name="extent_w" type="u32"/>
+    <arg name="extent_h" type="u32"/>
+    <arg name="count" type="u32"/>
   </request>
 
 
@@ -223,6 +253,91 @@
   -->
   <event name="release_syncobj" opcode="5">
     <fds count="1"/>
+  </event>
+
+  <!--
+    Producer capability declaration — sent exactly once after `ready`
+    and before any `bind_buffers`. Communicates everything the daemon
+    needs to pair this renderer with consumers and pick a transferable
+    DMA-BUF descriptor.
+
+    Encoding:
+      Parallel arrays. `fourccs[i]` advertises a DRM format the
+      producer can allocate; `mod_counts[i]` is the number of modifiers
+      it supports for that format. Modifiers/usages/plane_counts are
+      flattened fourcc-major:
+
+        modifiers[ sum(mod_counts[0..i]) .. +mod_counts[i] ]
+        usages[    same range ]
+        plane_counts[ same range ]
+
+      Validation: modifiers.len == usages.len == plane_counts.len ==
+      sum(mod_counts).
+
+    Bit definitions (mirrored across producer + consumer caps):
+      `usage` per (fourcc, modifier):
+        bit 0 = SAMPLED               can be sampled from a shader
+        bit 1 = STORAGE               GPU storage image
+        bit 2 = COLOR_ATTACHMENT      can be rendered into
+        bit 3 = DEPTH_STENCIL         depth/stencil target
+        bit 4 = TRANSFER_SRC          blit source
+        bit 5 = TRANSFER_DST          blit destination
+        bit 6 = SCANOUT               can be directly scanned out by KMS
+      `mem_hints`:
+        bit 0 = DEVICE_LOCAL          producer prefers VRAM placement
+        bit 1 = HOST_VISIBLE          producer can also do GTT/system
+        bit 2 = SCANOUT_CAPABLE       producer can place in scanout-able mem
+        bit 3 = PROTECTED             reserved (DRM/HDCP)
+      `sync_caps`:
+        bit 0 = IMPLICIT              dma_fence on dma-buf
+        bit 1 = SYNCOBJ_BINARY        binary drm_syncobj fd (one-shot)
+        bit 2 = SYNCOBJ_TIMELINE      timeline drm_syncobj (multi-point)
+      `color_caps` (packed; OR together):
+        bits 0..3 = encoding bitset:    sRGB | linear | BT601 | BT709 | BT2020 (...)
+        bits 4..5 = range bitset:       full | limited
+        bit 6     = ALPHA_PREMULTIPLIED supported
+        bit 7     = ALPHA_STRAIGHT      supported
+
+    Device identity:
+      `device_uuid` / `driver_uuid` — 16 bytes each, encoded as 4×u32
+      LE for codegen friendliness. Source: Vulkan
+      `VkPhysicalDeviceIDProperties.{deviceUUID,driverUUID}`. All zeros
+      means "unknown" — the daemon falls back to drm_render major:minor.
+  -->
+  <event name="format_caps" opcode="6">
+    <arg name="fourccs" type="array" element="u32"/>
+    <arg name="mod_counts" type="array" element="u32"/>
+    <arg name="modifiers" type="array" element="u64"/>
+    <arg name="usages" type="array" element="u32"/>
+    <arg name="plane_counts" type="array" element="u32"/>
+    <arg name="device_uuid" type="array" element="u32"/>
+    <arg name="driver_uuid" type="array" element="u32"/>
+    <arg name="drm_render_major" type="u32"/>
+    <arg name="drm_render_minor" type="u32"/>
+    <arg name="mem_hints" type="u32"/>
+    <arg name="sync_caps" type="u32"/>
+    <arg name="color_caps" type="u32"/>
+    <arg name="extent_max_w" type="u32"/>
+    <arg name="extent_max_h" type="u32"/>
+  </event>
+
+  <!--
+    Renderer-side report that a `negotiate_buffers` could not be
+    satisfied. Non-terminal: the daemon adds (fourcc, modifier) to
+    this renderer's per-peer blacklist and re-runs `negotiate::pick`.
+    `reason` codes:
+      0 = import_failed       allocator/driver refused the modifier
+      1 = oom                 system / device memory exhausted
+      2 = feature_unsupported (rare) sync_mode / color / mem_hint
+                              required by the negotiation isn't
+                              actually available on this device
+      3 = other               see `message` for details
+  -->
+  <event name="bind_failed" opcode="7">
+    <arg name="fourcc" type="u32"/>
+    <arg name="modifier" type="u64"/>
+    <arg name="reason" type="u32"/>
+    <arg name="message" type="string"/>
   </event>
 
 </protocol>

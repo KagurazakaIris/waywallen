@@ -17,9 +17,16 @@ use crate::sync::{drm_device, FrameRecord};
 /// Server version string advertised in `welcome.server_version`.
 pub const SERVER_VERSION: &str = concat!("waywallen ", env!("CARGO_PKG_VERSION"));
 
-/// v1 mandatory feature flags. Consumers verify these are present in
+/// Mandatory feature flags. Consumers verify these are present in
 /// `welcome.features` and disconnect if not.
-const MANDATORY_FEATURES: &[&str] = &["explicit_sync_fd", "drm_syncobj_release"];
+///   "explicit_sync_fd"        — acquire fence as dma_fence sync_file (v1+).
+///   "drm_syncobj_release"     — release fence as drm_syncobj fd (v1+).
+///   "modifier_negotiation_v1" — consumer_caps + bind_failed plumbing (v2).
+const MANDATORY_FEATURES: &[&str] = &[
+    "explicit_sync_fd",
+    "drm_syncobj_release",
+    "modifier_negotiation_v1",
+];
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -208,6 +215,13 @@ async fn do_handshake(
             minor: drm_render_minor,
         },
         properties,
+        // consumer_caps arrives ASYNCHRONOUSLY in the frame loop's
+        // request handler (see run_frame_loop) — we don't block the
+        // handshake on it. Iter 2 design: the consumer SHOULD send
+        // consumer_caps right after register_display, but tests +
+        // legacy paths might not, and forcing it here couples
+        // handshake completion to a non-essential message.
+        consumer_caps: None,
     })
 }
 
@@ -277,6 +291,44 @@ async fn run_frame_loop(
                 Some(Ok(Request::UpdateDisplay { width, height, properties: _ })) => {
                     router.update_display_size(display_id, width, height).await;
                     log::info!("display {display_id}: resized to {width}x{height}");
+                }
+                Some(Ok(Request::ConsumerCaps {
+                    fourccs, mod_counts, modifiers, usages, plane_counts,
+                    device_uuid, driver_uuid, drm_render_major, drm_render_minor,
+                    mem_hints, sync_caps, color_caps, extent_max_w, extent_max_h,
+                })) => {
+                    let drm = crate::renderer_manager::DrmNode {
+                        major: drm_render_major, minor: drm_render_minor,
+                    };
+                    match crate::negotiate::unflatten_caps(
+                        &fourccs, &mod_counts, &modifiers, &usages, &plane_counts,
+                        &device_uuid, &driver_uuid, drm,
+                        sync_caps, color_caps, mem_hints,
+                        (extent_max_w, extent_max_h),
+                    ) {
+                        Ok(caps) => {
+                            let prefix = format!("display {display_id}: consumer_caps");
+                            log::info!(
+                                "{prefix}: imported {} fourcc{}",
+                                caps.formats.by_fourcc.len(),
+                                if caps.formats.by_fourcc.len() == 1 { "" } else { "s" },
+                            );
+                            caps.log_dump(&prefix);
+                            router.set_consumer_caps(display_id, caps).await;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "display {display_id}: ConsumerCaps malformed: {e:?}"
+                            );
+                        }
+                    }
+                }
+                Some(Ok(Request::BindFailed { fourcc, modifier, reason, message })) => {
+                    log::warn!(
+                        "display {display_id}: BindFailed fourcc=0x{fourcc:08x} \
+                         modifier=0x{modifier:x} reason={reason} msg={message:?}"
+                    );
+                    router.on_consumer_bind_failed(display_id, fourcc, modifier).await;
                 }
                 Some(Ok(Request::Bye)) => {
                     log::info!("display {display_id}: bye");
