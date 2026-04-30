@@ -1029,6 +1029,18 @@ impl Router {
                 let Some(producer_caps) = renderer.format_caps() else {
                     continue; // legacy renderer — skip silently
                 };
+                // Buffer extent must match what the renderer actually
+                // produces. For the image plugin that's the post-decode
+                // RGBA size from --width/--height; for video/scene it's
+                // the renderer's render target. Using the *display*
+                // size here breaks any renderer that doesn't internally
+                // resize to fit (image renderer's vkCmdCopyBufferToImage
+                // would read OOB past its staging buffer and tile the
+                // smaller decode across the larger DMA-BUF — visible as
+                // an enlarged/repeated/striped image). The consumer
+                // scales the buffer to its surface via wp_viewport, so
+                // the buffer extent doesn't need to equal display size.
+                let extent = (renderer.width, renderer.height);
                 for link in inner.table.links_for_renderer(&rid) {
                     if !link.enabled {
                         continue;
@@ -1044,7 +1056,7 @@ impl Router {
                         did: link.display_id,
                         producer: producer_caps.clone(),
                         consumer: consumer_caps,
-                        extent: (state.info.width, state.info.height),
+                        extent,
                     });
                 }
             }

@@ -331,7 +331,7 @@ static int print_caps_json(const Options& opt) {
     }
 
     int sv[2] = { -1, -1 };
-    if (::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) {
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         std::fprintf(stderr,
                      "waywallen-image-renderer: socketpair: %s\n",
                      std::strerror(errno));
