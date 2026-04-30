@@ -27,17 +27,16 @@ extern "C" {
 #define WW_USAGE_TRANSFER_SRC     (1u << 4)
 #define WW_USAGE_TRANSFER_DST     (1u << 5)
 
-/* `mem_hints`: where the dmabuf is backed. The picker forces
- * HOST_VISIBLE on cross-GPU links so PRIME-import works on the
- * consumer side; same-GPU prefers DEVICE_LOCAL when available.
- * LINEAR_ONLY (v3) is the producer's signal that its modifier-aware
- * probe returned no usable entries — daemon must pick COMPAT_LINEAR
- * regardless of consumer caps. */
+/* `mem_hints`: where the dmabuf is backed. Topology-first picker:
+ * cross-device emits 0 (bridge picks any dma-buf-exportable type);
+ * same-device prefers DEVICE_LOCAL when both peers have it.
+ * LINEAR_ONLY is reserved/legacy — bridges may stop setting it,
+ * daemon ignores. Bit value preserved for wire compatibility. */
 #define WW_MEM_HINT_DEVICE_LOCAL  (1u << 0)
 #define WW_MEM_HINT_HOST_VISIBLE  (1u << 1)
 #define WW_MEM_HINT_SCANOUT       (1u << 2)
 #define WW_MEM_HINT_PROTECTED     (1u << 3)
-#define WW_MEM_HINT_LINEAR_ONLY   (1u << 4)
+#define WW_MEM_HINT_LINEAR_ONLY   (1u << 4)  /* legacy; not consumed */
 
 /* `sync_caps`: which fence flavours the peer supports. The picker
  * lands on the highest tier both sides advertise. */

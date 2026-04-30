@@ -125,7 +125,7 @@ static int probe_caps(ww_pool_t *pool, uint32_t width, uint32_t height) {
     if (mod_list.drmFormatModifierCount == 0) {
         fprintf(stderr,
                 "ww_pool[vulkan]: driver reports 0 modifiers for ABGR8888 — "
-                "advertising LINEAR_ONLY\n");
+                "advertising single LINEAR fallback\n");
         ww_format_entry_t *ent = (ww_format_entry_t *)calloc(1, sizeof(*ent));
         if (!ent) return -ENOMEM;
         ent[0].fourcc      = WW_DRM_FORMAT_ABGR8888;
@@ -133,7 +133,6 @@ static int probe_caps(ww_pool_t *pool, uint32_t width, uint32_t height) {
         ent[0].plane_count = 1;
         pool->caps.entries = ent;
         pool->caps.count   = 1;
-        pool->caps.mem_hints |= WW_MEM_HINT_LINEAR_ONLY;
         goto fill_secondary;
     }
 
@@ -186,21 +185,25 @@ fill_secondary: ;
 }
 
 /* Pick a memory type from the producer device that can back an
- * exportable VkImage. `want_host_visible` true → HOST_VISIBLE and not
- * DEVICE_LOCAL (so foreign GPUs can PRIME-import). false →
- * DEVICE_LOCAL. Returns UINT32_MAX on no match. */
-static uint32_t pick_memory_type(vk_state_t *st, uint32_t type_bits,
-                                 bool want_host_visible) {
+ * exportable VkImage. Cross-GPU PRIME translates regardless of
+ * HOST_VISIBLE / DEVICE_LOCAL — the only correctness requirement is
+ * dma-buf exportability, which is enforced at vkCreateImage time
+ * via VkExternalMemoryImageCreateInfo.handleTypes = DMA_BUF_BIT_EXT.
+ * Prefer DEVICE_LOCAL when allowed (faster), else any matching type.
+ * Returns UINT32_MAX only if typeBits is empty. */
+static uint32_t pick_memory_type(vk_state_t *st, uint32_t type_bits) {
     VkPhysicalDeviceMemoryProperties mp = {0};
     st->vkGetPhysicalDeviceMemoryProperties(st->phys, &mp);
+    /* Pass 1: prefer DEVICE_LOCAL. */
     for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
         if (!(type_bits & (1u << i))) continue;
-        VkMemoryPropertyFlags pf = mp.memoryTypes[i].propertyFlags;
-        bool ok = want_host_visible
-            ? ((pf & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-               !(pf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-            : ((pf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0);
-        if (ok) return i;
+        if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            return i;
+        }
+    }
+    /* Pass 2: any allowed type. */
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if (type_bits & (1u << i)) return i;
     }
     return UINT32_MAX;
 }
@@ -277,23 +280,8 @@ static int alloc_slot(ww_pool_t *pool, uint32_t slot_index,
     mr.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
     st->vkGetImageMemoryRequirements2(st->device, &mri, &mr);
 
-    /* For COMPAT_LINEAR / GPU_LINEAR we want HOST_VISIBLE (GTT) so a
-     * foreign GPU can PRIME-import. For OPTIMIZED_SAME_DEVICE we
-     * prefer DEVICE_LOCAL. */
-    bool want_host_visible = linear_path;
-    uint32_t mem_type = pick_memory_type(st,
-                                         mr.memoryRequirements.memoryTypeBits,
-                                         want_host_visible);
-    if (mem_type == UINT32_MAX) {
-        /* Last resort: any memory type that satisfies typeBits. */
-        VkPhysicalDeviceMemoryProperties mp = {0};
-        st->vkGetPhysicalDeviceMemoryProperties(st->phys, &mp);
-        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-            if (mr.memoryRequirements.memoryTypeBits & (1u << i)) {
-                mem_type = i; break;
-            }
-        }
-    }
+    uint32_t mem_type = pick_memory_type(
+        st, mr.memoryRequirements.memoryTypeBits);
     if (mem_type == UINT32_MAX) {
         fprintf(stderr,
                 "ww_pool[vulkan]: no memory type matches image typeBits=0x%x\n",

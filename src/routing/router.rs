@@ -1078,11 +1078,14 @@ impl Router {
                 Ok(scheme) => {
                     log::info!(
                         "router: pick({rid}, display {did}) = \
+                         path={path:?} mem_source={ms:?} \
                          fourcc=0x{fourcc:08x} modifier=0x{modifier:x} \
                          plane_count={pc} sync=0x{sync:x} color=0x{color:x} \
                          mem_hint=0x{mem:x} extent={w}x{h} count={count}",
                         rid = p.rid,
                         did = p.did,
+                        path = scheme.path,
+                        ms = scheme.mem_source,
                         fourcc = scheme.fourcc,
                         modifier = scheme.modifier,
                         pc = scheme.plane_count,

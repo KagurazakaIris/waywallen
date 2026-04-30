@@ -169,12 +169,16 @@ pub enum PathCategory {
     /// Both peers on the same physical GPU. Use the daemon-picked
     /// (potentially tile/vendor) modifier.
     OptimizedSameDevice = 0,
-    /// Same vendor, different device (Iter 1 falls through to
-    /// `CompatLinear`; Iter 2 implements vendor-tier table).
+    /// Reserved wire-stable value `1`. The topology-first picker
+    /// never emits this — any cross-device pair (including same
+    /// driver) goes to [`CompatLinear`]. Tile-modifier PRIME across
+    /// distinct GPUs has no portable correctness story, so this
+    /// optimization tier was retired.
     OptimizedSameVendor = 1,
-    /// Cross-vendor / no UUID match / producer signaled
-    /// `LINEAR_ONLY`. Bridge forces LINEAR modifier and selects the
-    /// memory source named in `mem_source`.
+    /// Cross-device pair, OR same-device with the modifier
+    /// intersection collapsing to LINEAR. Bridge takes its LINEAR
+    /// allocation path (`GBM_BO_USE_LINEAR` / Vulkan dma-buf-
+    /// exportable LINEAR-tiled).
     CompatLinear = 2,
     /// Reserved Iter 3+: render to GPU memory, copy back to CPU,
     /// ship pixels through a separate channel. Daemon never emits in
@@ -251,11 +255,12 @@ pub const MEM_HINT_DEVICE_LOCAL: u32 = 1 << 0;
 pub const MEM_HINT_HOST_VISIBLE: u32 = 1 << 1;
 pub const MEM_HINT_SCANOUT_CAPABLE: u32 = 1 << 2;
 pub const MEM_HINT_PROTECTED: u32 = 1 << 3;
-/// v3: producer's modifier-aware probe yielded zero usable entries
-/// (e.g. NVIDIA proprietary where every modifier is external_only).
-/// The picker must select [`PathCategory::CompatLinear`] regardless
-/// of consumer caps. Mirrors `WW_MEM_HINT_LINEAR_ONLY` in
-/// `<waywallen-bridge/protocol_bits.h>`.
+/// Reserved wire-stable bit `1 << 4`. The topology-first picker
+/// no longer reads this — cross-device topology drives
+/// [`PathCategory::CompatLinear`] directly, and same-device falls
+/// through to LINEAR via the per-peer blacklist. Bridges may stop
+/// setting it; the daemon ignores it either way.
+#[deprecated = "no longer drives the picker; topology decides path"]
 pub const MEM_HINT_LINEAR_ONLY: u32 = 1 << 4;
 
 pub const SYNC_IMPLICIT: u32 = 1 << 0;
@@ -398,19 +403,22 @@ const COLOR_MASK_ALPHA: u32 = COLOR_ALPHA_PREMUL | COLOR_ALPHA_STRAIGHT;
 /// Default pool size when both sides leave it unspecified.
 const DEFAULT_POOL_COUNT: u32 = 3;
 
-/// Pick the best intersection of two peers' capabilities at `extent`.
+/// Pick a buffer scheme for a producer/consumer pair at `extent`.
 ///
-/// Format selection:
-///   1. `same_device` + non-LINEAR modifier in the intersection
-///      (after blacklist exclusion) → best non-LINEAR. Best = lowest
-///      fourcc value, then lowest non-LINEAR modifier value
-///      (deterministic; real GPUs converge after a single
-///      negotiation so a richer scoring policy adds nothing for the
-///      prototype).
-///   2. Else if LINEAR is in the intersection → LINEAR. This is the
-///      cross-vendor escape hatch — every in-tree driver supports
-///      LINEAR import.
-///   3. Else `Err(NoFormatIntersection)`.
+/// Topology-first dispatch:
+///   * **Same physical GPU** → optimized: intersect modifiers, prefer
+///     non-LINEAR; LINEAR is the within-fourcc fallback driven by
+///     the per-peer blacklist (`bind_failed` blacklists the failing
+///     modifier and the next call falls through). Path is
+///     `OptimizedSameDevice` for tile picks, `CompatLinear` when the
+///     intersection collapses to LINEAR.
+///   * **Different GPU** (any cross-device, including same-vendor
+///     dual-card) → compat: fourcc-set intersection only, modifier
+///     forced to LINEAR, path `CompatLinear`. The bridge's
+///     compat-linear allocator handles the source (GBM USE_LINEAR /
+///     Vulkan dma-buf-exportable). No modifier intersection is run
+///     across vendor or device boundaries — kernel PRIME with tile
+///     modifiers across heterogeneous GPUs has no safe story.
 ///
 /// Sync: `producer.sync & consumer.sync` then keep the highest bit
 /// in priority order TIMELINE > BINARY > IMPLICIT.
@@ -419,107 +427,91 @@ const DEFAULT_POOL_COUNT: u32 = 3;
 /// `consumer.color`; pick the lowest set bit per axis. If an axis
 /// has no overlap, fall back to that axis of [`DEFAULT_COLOR`].
 ///
-/// Mem hint: same-device → `producer.mem_hint & consumer.mem_hint`,
-/// preferring DEVICE_LOCAL when available. Cross-device → force
-/// HOST_VISIBLE so foreign-GPU PRIME import works.
+/// Mem hint: same-device only — `producer.mem_hint & consumer.mem_hint`,
+/// preferring DEVICE_LOCAL when available. Cross-device emits 0; the
+/// bridge's compat-linear path picks any dma-buf-exportable memory
+/// type without consulting this field.
 pub fn pick(
     producer: &PeerCaps,
     consumer: &PeerCaps,
     extent: (u32, u32),
 ) -> Result<NegotiatedScheme, NegotiateError> {
     let same_dev = producer.identity.same_device(&consumer.identity);
-    // Same vendor, different physical device (cross-card iGPU+dGPU,
-    // dual-AMD, dual-NVIDIA). Detected via Vulkan implementation UUID
-    // — `driver_uuid` is unique per driver build, not per chip, so a
-    // match means both peers' kernel/userspace stack is the same and
-    // any modifier they *both* advertise has been vetted by the same
-    // driver code for cross-device PRIME import.
-    let same_driver = !same_dev
-        && producer.identity.driver_uuid != [0u8; 16]
-        && consumer.identity.driver_uuid != [0u8; 16]
-        && producer.identity.driver_uuid == consumer.identity.driver_uuid;
-
-    // Producer signaled "modifier-aware probe found zero entries" via
-    // MEM_HINT_LINEAR_ONLY. The bridge already collapsed its caps to
-    // a single (fourcc, LINEAR, 1) row, but we honor the hint
-    // explicitly so no future code path "recovers" a tile modifier
-    // that the producer can't actually allocate.
-    let producer_linear_only = producer.mem_hint & MEM_HINT_LINEAR_ONLY != 0;
-
-    // Treat same-driver cross-device the same way as same-device for
-    // format selection: prefer non-LINEAR from the intersection. The
-    // intersection itself is the vendor-tier filter — drivers only
-    // advertise modifiers they can import. If a tiled pick still
-    // fails at runtime the consumer raises `bind_failed`, the daemon
-    // blacklists that modifier and the next pick falls through to
-    // LINEAR. No silent regressions.
-    let (fourcc, modifier, plane_count) = pick_format(
-        &producer.formats, &consumer.formats,
-        &producer.blacklist, &consumer.blacklist,
-        (same_dev || same_driver) && !producer_linear_only,
-    )?;
-
     let sync_mode = pick_sync(producer.sync, consumer.sync)?;
     let color = pick_color(producer.color, consumer.color);
-    let mem_hint = pick_mem_hint(producer.mem_hint, consumer.mem_hint, same_dev);
-    let (path, mem_source) =
-        classify_path(same_dev, same_driver, modifier, producer_linear_only);
 
+    if same_dev {
+        let (fourcc, modifier, plane_count) = pick_format_same_device(
+            &producer.formats, &consumer.formats,
+            &producer.blacklist, &consumer.blacklist,
+        )?;
+        // LINEAR within the same-device intersection means every
+        // tile modifier was either absent or blacklisted — fall to
+        // CompatLinear so the bridge takes its LINEAR allocation
+        // path (GBM_BO_USE_LINEAR / Vulkan LINEAR-tiled exportable).
+        let (path, mem_source) = if modifier == DRM_FORMAT_MOD_LINEAR {
+            (PathCategory::CompatLinear, MemSource::GpuLinear)
+        } else {
+            (PathCategory::OptimizedSameDevice, MemSource::GpuNative)
+        };
+        let mem_hint = pick_mem_hint_same_dev(producer.mem_hint, consumer.mem_hint);
+        return Ok(NegotiatedScheme {
+            fourcc, modifier, plane_count, sync_mode, color, mem_hint,
+            extent, count: DEFAULT_POOL_COUNT, path, mem_source,
+        });
+    }
+
+    // Cross-device — fourcc-only match, force LINEAR.
+    let fourcc = pick_fourcc_only(
+        &producer.formats, &consumer.formats,
+        &producer.blacklist, &consumer.blacklist,
+    )?;
     Ok(NegotiatedScheme {
         fourcc,
-        modifier,
-        plane_count,
+        modifier: DRM_FORMAT_MOD_LINEAR,
+        plane_count: 1,
         sync_mode,
         color,
-        mem_hint,
+        mem_hint: 0,
         extent,
         count: DEFAULT_POOL_COUNT,
-        path,
-        mem_source,
+        path: PathCategory::CompatLinear,
+        mem_source: MemSource::GpuLinear,
     })
 }
 
-/// Classify the topology + chosen modifier into a path/mem_source
-/// pair. The bridge dispatches its allocation strategy purely on
-/// these.
-///
-///   * `OptimizedSameDevice` (non-LINEAR, same physical GPU) → bridge
-///     allocates with `GBM_BO_USE_RENDERING` + named tile modifier.
-///   * `OptimizedSameVendor` (non-LINEAR, same driver, different
-///     device) → same allocation strategy as `OptimizedSameDevice`;
-///     the modifier-intersection vetted both ends, kernel PRIME
-///     import covers the rest. Failures surface explicitly as
-///     `bind_failed` and the daemon blacklists + repicks.
-///   * `CompatLinear` (LINEAR modifier or `LINEAR_ONLY` hint or
-///     cross-vendor) → bridge takes the LINEAR path.
-fn classify_path(
-    same_dev: bool,
-    same_driver: bool,
-    modifier: u64,
-    producer_linear_only: bool,
-) -> (PathCategory, MemSource) {
-    if producer_linear_only || modifier == DRM_FORMAT_MOD_LINEAR {
-        return (PathCategory::CompatLinear, MemSource::GpuLinear);
-    }
-    if same_dev {
-        return (PathCategory::OptimizedSameDevice, MemSource::GpuNative);
-    }
-    if same_driver {
-        return (PathCategory::OptimizedSameVendor, MemSource::GpuNative);
-    }
-    // Cross-vendor with a non-LINEAR pick should be unreachable —
-    // pick_format only emits non-LINEAR when `same_dev || same_driver`
-    // is true. Defend anyway: cross-vendor non-LINEAR is the worst
-    // case for portability, downgrade to LINEAR.
-    (PathCategory::CompatLinear, MemSource::GpuLinear)
-}
-
-fn pick_format(
+/// Cross-device fourcc selection: walk producer order (BTreeMap is
+/// sorted), pick the first fourcc the consumer also lists where
+/// `(fourcc, LINEAR)` isn't blacklisted on either side. No modifier
+/// intersection — the bridge's compat-linear allocator will produce
+/// LINEAR via its own path regardless of what either peer advertised
+/// at the modifier level.
+fn pick_fourcc_only(
     producer: &FormatCaps,
     consumer: &FormatCaps,
     p_blacklist: &HashSet<(u32, u64)>,
     c_blacklist: &HashSet<(u32, u64)>,
-    same_dev: bool,
+) -> Result<u32, NegotiateError> {
+    for (&fourcc, _) in producer.by_fourcc.iter() {
+        if !consumer.by_fourcc.contains_key(&fourcc) {
+            continue;
+        }
+        if p_blacklist.contains(&(fourcc, DRM_FORMAT_MOD_LINEAR)) {
+            continue;
+        }
+        if c_blacklist.contains(&(fourcc, DRM_FORMAT_MOD_LINEAR)) {
+            continue;
+        }
+        return Ok(fourcc);
+    }
+    Err(NegotiateError::NoFormatIntersection)
+}
+
+fn pick_format_same_device(
+    producer: &FormatCaps,
+    consumer: &FormatCaps,
+    p_blacklist: &HashSet<(u32, u64)>,
+    c_blacklist: &HashSet<(u32, u64)>,
 ) -> Result<(u32, u64, u32), NegotiateError> {
     // Walk fourccs in sorted order so the picker's choice is stable
     // across runs (BTreeMap iteration). Within a fourcc we walk
@@ -562,21 +554,16 @@ fn pick_format(
             }
         }
 
-        // Same-device + non-LINEAR available? Take the first
-        // non-LINEAR in producer order. We prefer non-LINEAR strictly
-        // when same-device because tiled/compressed formats are
-        // usually a perf win.
-        if same_dev {
-            if let Some(&(m, pc)) = intersect.iter().find(|(m, _)| *m != DRM_FORMAT_MOD_LINEAR) {
-                // Score: prefer the lowest fourcc value seen so far.
-                if best_non_linear
-                    .map(|(prev_fourcc, _, _)| fourcc < prev_fourcc)
-                    .unwrap_or(true)
-                {
-                    best_non_linear = Some((fourcc, m, pc));
-                }
-                continue;
+        // Prefer non-LINEAR strictly when same-device — tiled/compressed
+        // formats are usually a perf win.
+        if let Some(&(m, pc)) = intersect.iter().find(|(m, _)| *m != DRM_FORMAT_MOD_LINEAR) {
+            if best_non_linear
+                .map(|(prev_fourcc, _, _)| fourcc < prev_fourcc)
+                .unwrap_or(true)
+            {
+                best_non_linear = Some((fourcc, m, pc));
             }
+            continue;
         }
         // Linear fallback if available on this fourcc.
         if let Some(&(_, pc)) = intersect.iter().find(|(m, _)| *m == DRM_FORMAT_MOD_LINEAR) {
@@ -623,12 +610,7 @@ fn pick_color(producer: u32, consumer: u32) -> u32 {
     pick_axis(COLOR_MASK_ENCODING) | pick_axis(COLOR_MASK_RANGE) | pick_axis(COLOR_MASK_ALPHA)
 }
 
-fn pick_mem_hint(producer: u32, consumer: u32, same_dev: bool) -> u32 {
-    if !same_dev {
-        // Cross-device: force HOST_VISIBLE regardless of producer pref.
-        // Foreign-GPU PRIME import fails on DEVICE_LOCAL VRAM.
-        return MEM_HINT_HOST_VISIBLE;
-    }
+fn pick_mem_hint_same_dev(producer: u32, consumer: u32) -> u32 {
     let common = producer & consumer;
     if common & MEM_HINT_DEVICE_LOCAL != 0 {
         MEM_HINT_DEVICE_LOCAL
@@ -638,10 +620,9 @@ fn pick_mem_hint(producer: u32, consumer: u32, same_dev: bool) -> u32 {
         // Some other bit set (PROTECTED, SCANOUT_CAPABLE) — keep it.
         common
     } else {
-        // Nothing in common. Cross-device path is excluded above; on
-        // same-device with empty intersection we have to make a guess.
-        // HOST_VISIBLE is the safer default (system memory always
-        // works); tagged with a warning at the call site.
+        // Nothing in common on same device — guess HOST_VISIBLE
+        // (system memory always works). Cross-device path emits 0
+        // and never reaches this function.
         MEM_HINT_HOST_VISIBLE
     }
 }
@@ -942,11 +923,10 @@ mod tests {
     }
 
     #[test]
-    fn pick_cross_device_falls_back_to_linear_and_forces_host_visible() {
+    fn pick_cross_device_uses_compat_linear() {
         // Different UUIDs; both advertise LINEAR + a non-LINEAR
-        // modifier. The non-LINEAR is theoretically common in value
-        // but cross-vendor it's never actually portable, so the
-        // policy ignores it and picks LINEAR.
+        // modifier. Topology-first dispatch ignores modifier
+        // intersection on cross-device pairs and emits LINEAR.
         let nl: u64 = 0x0100_0000_0000_0001;
         let p = caps_one_fourcc(
             DRM_FORMAT_ABGR8888,
@@ -965,9 +945,13 @@ mod tests {
             MEM_HINT_HOST_VISIBLE,
         );
         let s = pick(&p, &c, (640, 360)).unwrap();
+        assert_eq!(s.fourcc, DRM_FORMAT_ABGR8888);
         assert_eq!(s.modifier, DRM_FORMAT_MOD_LINEAR);
-        // Cross-device → HOST_VISIBLE forced regardless of producer pref.
-        assert_eq!(s.mem_hint, MEM_HINT_HOST_VISIBLE);
+        assert_eq!(s.path, PathCategory::CompatLinear);
+        assert_eq!(s.mem_source, MemSource::GpuLinear);
+        // Cross-device emits 0 — bridge picks any dma-buf-exportable
+        // memory type without consulting this field.
+        assert_eq!(s.mem_hint, 0);
     }
 
     #[test]
@@ -1021,11 +1005,12 @@ mod tests {
     }
 
     #[test]
-    fn pick_same_driver_cross_device_emits_optimized_same_vendor() {
+    fn pick_same_driver_cross_device_uses_compat_linear() {
         // Same driver_uuid, different device_uuid + different DRM minor
-        // (e.g. AMD iGPU + dGPU on a single machine). Both advertise
-        // a non-LINEAR modifier — the intersection itself acts as the
-        // vendor-tier filter, so we go OptimizedSameVendor.
+        // (e.g. dual-AMD or iGPU+dGPU). Topology-first: any cross-device
+        // → CompatLinear. The previously-emitted OptimizedSameVendor is
+        // retired — tile-modifier PRIME across distinct GPUs has no
+        // portable correctness story.
         let nl: u64 = 0x0200_0000_0000_0042;
         let p = caps_one_fourcc(
             DRM_FORMAT_ABGR8888,
@@ -1042,36 +1027,6 @@ mod tests {
             SYNC_SYNCOBJ_TIMELINE,
             DEFAULT_COLOR,
             MEM_HINT_DEVICE_LOCAL | MEM_HINT_HOST_VISIBLE,
-        );
-        let s = pick(&p, &c, (640, 360)).unwrap();
-        assert_eq!(s.modifier, nl, "same-driver cross-device should pick non-LINEAR");
-        assert_eq!(s.path, PathCategory::OptimizedSameVendor);
-        assert_eq!(s.mem_source, MemSource::GpuNative);
-        // Cross-device still forces HOST_VISIBLE — kernel PRIME import
-        // needs GTT-mappable backing on AMD/Intel.
-        assert_eq!(s.mem_hint, MEM_HINT_HOST_VISIBLE);
-    }
-
-    #[test]
-    fn pick_same_driver_only_linear_intersect_falls_to_compat_linear() {
-        // Same driver, different device, but the only common modifier
-        // is LINEAR. Stays CompatLinear + GpuLinear — there's no tile
-        // to optimize.
-        let p = caps_one_fourcc(
-            DRM_FORMAT_ABGR8888,
-            &[(DRM_FORMAT_MOD_LINEAR, 1)],
-            ident_split_uuid(0x77, 0xA1, 128),
-            SYNC_SYNCOBJ_TIMELINE,
-            DEFAULT_COLOR,
-            MEM_HINT_HOST_VISIBLE,
-        );
-        let c = caps_one_fourcc(
-            DRM_FORMAT_ABGR8888,
-            &[(DRM_FORMAT_MOD_LINEAR, 1)],
-            ident_split_uuid(0x77, 0xB2, 129),
-            SYNC_SYNCOBJ_TIMELINE,
-            DEFAULT_COLOR,
-            MEM_HINT_HOST_VISIBLE,
         );
         let s = pick(&p, &c, (640, 360)).unwrap();
         assert_eq!(s.modifier, DRM_FORMAT_MOD_LINEAR);
@@ -1106,34 +1061,170 @@ mod tests {
         assert_eq!(s.mem_source, MemSource::GpuLinear);
     }
 
-    #[test]
-    fn pick_linear_only_hint_overrides_same_driver_optimization() {
-        // Same driver + non-LINEAR available, but producer signaled
-        // MEM_HINT_LINEAR_ONLY (its modifier-aware probe returned
-        // empty). Forced CompatLinear regardless.
-        let nl: u64 = 0x0200_0000_0000_0042;
-        let p = caps_one_fourcc(
-            DRM_FORMAT_ABGR8888,
-            // Producer's caps are already collapsed by the bridge to
-            // LINEAR-only when LINEAR_ONLY is set; mirror that here.
-            &[(DRM_FORMAT_MOD_LINEAR, 1)],
-            ident_split_uuid(0x77, 0xA1, 128),
+    /// Build a PeerCaps with multiple fourccs, each carrying a list of
+    /// (modifier, plane_count). Used by the cross-device fourcc-only
+    /// tests below.
+    fn caps_multi_fourcc(
+        entries: &[(u32, &[(u64, u32)])],
+        identity: DeviceIdentity,
+    ) -> PeerCaps {
+        let fourccs: Vec<u32> = entries.iter().map(|(f, _)| *f).collect();
+        let mod_counts: Vec<u32> = entries.iter().map(|(_, m)| m.len() as u32).collect();
+        let mut modifiers: Vec<u64> = Vec::new();
+        let mut plane_counts: Vec<u32> = Vec::new();
+        let mut usages: Vec<u32> = Vec::new();
+        for (_, mods) in entries {
+            for (m, p) in *mods {
+                modifiers.push(*m);
+                plane_counts.push(*p);
+                usages.push(USAGE_SAMPLED);
+            }
+        }
+        let dev_words: Vec<u32> = identity
+            .device_uuid
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let drv_words: Vec<u32> = identity
+            .driver_uuid
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        unflatten_caps(
+            &fourccs,
+            &mod_counts,
+            &modifiers,
+            &usages,
+            &plane_counts,
+            &dev_words,
+            &drv_words,
+            identity.drm,
             SYNC_SYNCOBJ_TIMELINE,
             DEFAULT_COLOR,
-            MEM_HINT_HOST_VISIBLE | MEM_HINT_LINEAR_ONLY,
+            MEM_HINT_HOST_VISIBLE,
+            (1920, 1080),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pick_cross_device_picks_first_common_fourcc() {
+        // Producer order: ABGR, XRGB. Consumer: XRGB, RGBA. No modifier
+        // overlap on either fourcc — but the cross-device path doesn't
+        // intersect modifiers, so XRGB (first common) wins.
+        let p = caps_multi_fourcc(
+            &[
+                (DRM_FORMAT_ABGR8888, &[(0x0300_0000_0000_0001, 1)]),
+                (DRM_FORMAT_XRGB8888, &[(0x0300_0000_0000_0002, 1)]),
+            ],
+            ident_uuid(0xAA),
+        );
+        let c = caps_multi_fourcc(
+            &[
+                (DRM_FORMAT_XRGB8888, &[(0x0200_0000_0000_0001, 1)]),
+                (0x4142_4347, &[(DRM_FORMAT_MOD_LINEAR, 1)]), // 'GCBA' arbitrary
+            ],
+            ident_uuid(0xBB),
+        );
+        let s = pick(&p, &c, (640, 360)).unwrap();
+        // BTreeMap order: 'AB24' = 0x34324241, 'XR24' = 0x34325258 —
+        // ABGR comes first in producer iteration but consumer doesn't
+        // list it, so XRGB is the first common fourcc.
+        assert_eq!(s.fourcc, DRM_FORMAT_XRGB8888);
+        assert_eq!(s.modifier, DRM_FORMAT_MOD_LINEAR);
+        assert_eq!(s.path, PathCategory::CompatLinear);
+        assert_eq!(s.mem_source, MemSource::GpuLinear);
+    }
+
+    #[test]
+    fn pick_cross_device_only_tile_modifiers_in_producer() {
+        // The user-reported NVIDIA mpv ↔ AMD layer-shell scenario:
+        // producer (NVIDIA EGL) advertises an NV-tile modifier without
+        // LINEAR; consumer (AMD Vulkan) advertises an AMD-tile + LINEAR.
+        // Pre-refactor this hit NoFormatIntersection; topology-first
+        // gives ABGR + LINEAR.
+        let nv_tile: u64 = 0x0300_0000_0060_6010;
+        let amd_tile: u64 = 0x0200_0000_0008_2305;
+        let p = caps_one_fourcc(
+            DRM_FORMAT_ABGR8888,
+            &[(nv_tile, 1)],
+            ident_uuid(0xAA),
+            SYNC_SYNCOBJ_TIMELINE,
+            DEFAULT_COLOR,
+            MEM_HINT_HOST_VISIBLE,
         );
         let c = caps_one_fourcc(
             DRM_FORMAT_ABGR8888,
-            &[(DRM_FORMAT_MOD_LINEAR, 1), (nl, 1)],
-            ident_split_uuid(0x77, 0xB2, 129),
+            &[(amd_tile, 1), (DRM_FORMAT_MOD_LINEAR, 1)],
+            ident_uuid(0xBB),
             SYNC_SYNCOBJ_TIMELINE,
             DEFAULT_COLOR,
             MEM_HINT_HOST_VISIBLE,
         );
         let s = pick(&p, &c, (640, 360)).unwrap();
+        assert_eq!(s.fourcc, DRM_FORMAT_ABGR8888);
         assert_eq!(s.modifier, DRM_FORMAT_MOD_LINEAR);
         assert_eq!(s.path, PathCategory::CompatLinear);
         assert_eq!(s.mem_source, MemSource::GpuLinear);
+    }
+
+    #[test]
+    fn pick_cross_device_blacklist_skips_fourcc() {
+        // Producer: ABGR, XRGB. Consumer: ABGR, XRGB. Without blacklist
+        // we'd take ABGR. Blacklist (ABGR, LINEAR) on producer → fall
+        // through to XRGB.
+        let mut p = caps_multi_fourcc(
+            &[
+                (DRM_FORMAT_ABGR8888, &[(0x0300_0000_0000_0001, 1)]),
+                (DRM_FORMAT_XRGB8888, &[(0x0300_0000_0000_0002, 1)]),
+            ],
+            ident_uuid(0xAA),
+        );
+        let c = caps_multi_fourcc(
+            &[
+                (DRM_FORMAT_ABGR8888, &[(DRM_FORMAT_MOD_LINEAR, 1)]),
+                (DRM_FORMAT_XRGB8888, &[(DRM_FORMAT_MOD_LINEAR, 1)]),
+            ],
+            ident_uuid(0xBB),
+        );
+        p.blacklist.insert((DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR));
+        let s = pick(&p, &c, (640, 360)).unwrap();
+        assert_eq!(s.fourcc, DRM_FORMAT_XRGB8888);
+        assert_eq!(s.modifier, DRM_FORMAT_MOD_LINEAR);
+    }
+
+    #[test]
+    fn pick_no_topology_falls_back_to_compat() {
+        // Both UUIDs zero, distinct DRM render nodes → same_device
+        // returns false → cross-device branch.
+        let p = caps_one_fourcc(
+            DRM_FORMAT_ABGR8888,
+            &[(DRM_FORMAT_MOD_LINEAR, 1)],
+            DeviceIdentity {
+                device_uuid: [0; 16],
+                driver_uuid: [0; 16],
+                drm: DrmNode { major: 226, minor: 128 },
+            },
+            SYNC_SYNCOBJ_TIMELINE,
+            DEFAULT_COLOR,
+            MEM_HINT_HOST_VISIBLE,
+        );
+        let c = caps_one_fourcc(
+            DRM_FORMAT_ABGR8888,
+            &[(DRM_FORMAT_MOD_LINEAR, 1)],
+            DeviceIdentity {
+                device_uuid: [0; 16],
+                driver_uuid: [0; 16],
+                drm: DrmNode { major: 226, minor: 130 },
+            },
+            SYNC_SYNCOBJ_TIMELINE,
+            DEFAULT_COLOR,
+            MEM_HINT_HOST_VISIBLE,
+        );
+        let s = pick(&p, &c, (640, 360)).unwrap();
+        assert_eq!(s.path, PathCategory::CompatLinear);
+        assert_eq!(s.mem_source, MemSource::GpuLinear);
+        assert_eq!(s.mem_hint, 0);
     }
 
     #[test]
