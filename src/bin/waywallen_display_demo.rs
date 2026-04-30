@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use waywallen::display_proto::{codec, Event, Request, PROTOCOL_NAME};
+use waywallen::display_proto::{codec, Event, Request, PROTOCOL_NAME, PROTOCOL_VERSION};
 
 #[derive(Debug)]
 struct Args {
@@ -133,6 +133,7 @@ fn run_session(sock_path: &Path, args: &Args) -> Result<()> {
             protocol: PROTOCOL_NAME.to_string(),
             client_name: args.name.clone(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
+            client_protocol_version: PROTOCOL_VERSION,
         },
         &[],
     )

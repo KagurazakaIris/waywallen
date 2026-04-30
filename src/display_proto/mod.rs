@@ -23,6 +23,15 @@ pub use codec::{
 };
 pub use generated::{opcode, DecodeError, Event, Rect, Request, PROTOCOL_NAME, PROTOCOL_VERSION};
 
+/// Wire-level `error.code` values. Kept in lockstep with the table in
+/// `protocol/waywallen_display_v1.xml`'s header comment.
+pub mod error_code {
+    /// `hello.protocol` did not match `PROTOCOL_NAME`.
+    pub const PROTO_NAME_MISMATCH: u32 = 1;
+    /// `hello.client_protocol_version` outside daemon's supported range.
+    pub const VERSION_UNSUPPORTED: u32 = 2;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,8 +52,8 @@ mod tests {
 
     #[test]
     fn protocol_identity() {
-        assert_eq!(PROTOCOL_NAME, "waywallen-display-v2");
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_NAME, "waywallen-display-v3");
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]
@@ -53,6 +62,7 @@ mod tests {
             protocol: PROTOCOL_NAME.to_string(),
             client_name: "libwaywallen_display".to_string(),
             client_version: "0.1.0".to_string(),
+            client_protocol_version: PROTOCOL_VERSION,
         });
     }
 

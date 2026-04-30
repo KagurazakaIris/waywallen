@@ -58,7 +58,23 @@
     - Display never panics/aborts; any wire or protocol error results
       in on_disconnected and cleanup. Server is free to crash.
 
-  Version: 2
+  Version: 3
+
+  Versioning policy (daemon-authoritative):
+    - `hello.client_protocol_version` is a single u32 declared by the
+      client. The daemon owns the supported range [MIN..=MAX]; any
+      client version outside that range is rejected with
+      `error{code = WW_ERR_VERSION_UNSUPPORTED, message = ...}` and the
+      connection is closed. The client does NOT verify daemon version;
+      `welcome.server_version` is informational/diagnostic only.
+    - The version number is independent of the lib's API/ABI version
+      (libwaywallen_display SO version) — it tracks ONLY this XML's
+      `<protocol version="...">` attribute.
+
+  Error codes (carried in `error.code`):
+    1 — WW_ERR_PROTO_NAME_MISMATCH    (hello.protocol string mismatch)
+    2 — WW_ERR_VERSION_UNSUPPORTED    (hello.client_protocol_version
+                                       outside daemon's supported range)
 
   v2 (modifier negotiation):
     - Consumer ships `consumer_caps` request immediately after
@@ -72,13 +88,21 @@
       blacklists that (fourcc, modifier) pair on this consumer and
       retries the picker. Non-terminal — only `error` is terminal.
 
-  Required features (must appear in welcome.features):
+  v3 (explicit version negotiation):
+    - `hello` carries `client_protocol_version: u32` so the daemon can
+      reject too-old / too-new clients deterministically instead of
+      relying on the protocol-name string suffix.
+    - `welcome.features` is now informational. The daemon guarantees
+      the feature set implied by the negotiated version; clients MUST
+      NOT gate on features field contents.
+
+  Informational features (welcome.features, advisory only in v3+):
     "explicit_sync_fd"           — acquire fence as dma_fence sync_file.
     "drm_syncobj_release"        — release fence as drm_syncobj fd.
     "modifier_negotiation_v1"    — consumer_caps + bind_failed plumbing.
   Optional features (reserved): "color_management", "hdr"
 -->
-<protocol name="waywallen_display" version="2">
+<protocol name="waywallen_display" version="3">
 
   <!-- ==================================================================
        REQUESTS  (display -> manager)
@@ -86,13 +110,23 @@
 
   <!--
     Opening handshake. Must be the first message on a new connection.
-    Server verifies `protocol == "waywallen-display-v1"` and replies
-    with `welcome`.
+    Server verifies:
+      1. `protocol == PROTOCOL_NAME` (e.g. "waywallen-display-v3"); on
+         mismatch replies with `error{code=1}` and closes.
+      2. `client_protocol_version` is within the daemon's supported
+         [MIN..=MAX] range; on miss replies with `error{code=2}` and
+         closes.
+    On success the server replies with `welcome`.
+
+    `client_version` is a free-form human-readable string (e.g. lib
+    SemVer) used purely for logs/diagnostics. The version gate is
+    `client_protocol_version`.
   -->
   <request name="hello" opcode="1">
     <arg name="protocol" type="string"/>
     <arg name="client_name" type="string"/>
     <arg name="client_version" type="string"/>
+    <arg name="client_protocol_version" type="u32"/>
   </request>
 
   <!--
@@ -208,9 +242,12 @@
        ================================================================== -->
 
   <!--
-    Reply to `hello`. Advertises server version and supported features.
-    v1 clients MUST verify that `features` contains "explicit_sync_fd"
-    and disconnect otherwise.
+    Reply to `hello`. Both fields are advisory in v3+:
+      - `server_version` is a free-form human-readable string for logs.
+      - `features` lists the daemon-guaranteed feature set implied by
+        the negotiated protocol version. Clients MUST NOT gate on the
+        contents — version negotiation has already happened by the
+        time `welcome` is sent, and the daemon is authoritative.
   -->
   <event name="welcome" opcode="1">
     <arg name="server_version" type="string"/>

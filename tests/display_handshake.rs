@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use waywallen::display_endpoint;
-use waywallen::display_proto::{codec, Event, Request, PROTOCOL_NAME};
+use waywallen::display_proto::{codec, error_code, Event, Request, PROTOCOL_NAME, PROTOCOL_VERSION};
 use waywallen::renderer_manager::RendererManager;
 use waywallen::routing::Router;
 
@@ -61,6 +61,7 @@ async fn handshake_up_to_display_accepted() {
                 protocol: PROTOCOL_NAME.to_string(),
                 client_name: "handshake-test".to_string(),
                 client_version: "0.0.1".to_string(),
+                client_protocol_version: PROTOCOL_VERSION,
             },
             &[],
         )
@@ -155,6 +156,7 @@ async fn rejects_wrong_protocol_string() {
                 protocol: "nope-v0".to_string(),
                 client_name: "bad".to_string(),
                 client_version: "0".to_string(),
+                client_protocol_version: PROTOCOL_VERSION,
             },
             &[],
         )
@@ -171,6 +173,82 @@ async fn rejects_wrong_protocol_string() {
     .expect("client flow");
 
     assert!(got_error, "server must reject bad protocol string");
+    server_task.abort();
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// `client_protocol_version` outside the daemon's supported range
+/// must produce `error{code = VERSION_UNSUPPORTED}` followed by close.
+#[tokio::test]
+async fn rejects_unsupported_client_protocol_version() {
+    let sock = common::tmp_sock("display-bad-version");
+    let _ = std::fs::remove_file(&sock);
+
+    let mgr = Arc::new(RendererManager::new_default());
+    let router = Router::new(Arc::clone(&mgr));
+    let sock_for_task = sock.clone();
+    let server_task = tokio::spawn({
+        let router = Arc::clone(&router);
+        async move {
+            let _ = display_endpoint::serve(&sock_for_task, router).await;
+        }
+    });
+
+    assert!(
+        common::wait_for_sock_bind(&sock, Duration::from_secs(2)).await,
+        "display endpoint did not bind"
+    );
+
+    // Probe both ends of the range: too high and too low (saturating
+    // to 0 if PROTOCOL_VERSION is already 0, in which case low_probe
+    // == 0 and the test still exercises a non-supported value when
+    // MIN_SUPPORTED > 0; otherwise low_probe == PROTOCOL_VERSION - 1).
+    let high_probe = PROTOCOL_VERSION.saturating_add(99);
+    for probe in [high_probe, PROTOCOL_VERSION.saturating_sub(1)] {
+        if probe == PROTOCOL_VERSION {
+            // PROTOCOL_VERSION is 0 — skip the underflow probe.
+            continue;
+        }
+        let sock_for_client = sock.clone();
+        let saw_version_error =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                use std::os::unix::net::UnixStream;
+                let stream = UnixStream::connect(&sock_for_client)?;
+                codec::send_request(
+                    &stream,
+                    &Request::Hello {
+                        protocol: PROTOCOL_NAME.to_string(),
+                        client_name: "version-probe".to_string(),
+                        client_version: "0.0.1".to_string(),
+                        client_protocol_version: probe,
+                    },
+                    &[],
+                )
+                .map_err(|e| anyhow::anyhow!("send: {e}"))?;
+                match codec::recv_event(&stream) {
+                    Ok((Event::Error { code, message }, _)) => {
+                        anyhow::ensure!(
+                            code == error_code::VERSION_UNSUPPORTED,
+                            "expected VERSION_UNSUPPORTED ({}), got code={code} msg={message:?}",
+                            error_code::VERSION_UNSUPPORTED,
+                        );
+                        Ok(true)
+                    }
+                    Ok((other, _)) => {
+                        panic!("expected Error event, got opcode {}", other.opcode())
+                    }
+                    Err(e) => panic!("expected Error event, got recv err: {e}"),
+                }
+            })
+            .await
+            .expect("client join")
+            .expect("client flow");
+        assert!(
+            saw_version_error,
+            "probe v{probe}: server must send VERSION_UNSUPPORTED error"
+        );
+    }
+
     server_task.abort();
     let _ = std::fs::remove_file(&sock);
 }

@@ -8,21 +8,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::display_proto::generated::Rect;
-use crate::display_proto::{codec, opcode, Event, Request, PROTOCOL_NAME};
+use crate::display_proto::{codec, error_code, opcode, Event, Request, PROTOCOL_NAME, PROTOCOL_VERSION};
 use crate::renderer_manager::{BindSnapshot, RendererHandle};
 use crate::routing::{DisplayHandle, DisplayOutEvent, DisplayRegistration, Router};
 use crate::scheduler::ProjectedConfig;
 use crate::sync::{drm_device, FrameRecord};
 
 /// Server version string advertised in `welcome.server_version`.
+/// Free-form, informational; consumers do not gate on this.
 pub const SERVER_VERSION: &str = concat!("waywallen ", env!("CARGO_PKG_VERSION"));
 
-/// Mandatory feature flags. Consumers verify these are present in
-/// `welcome.features` and disconnect if not.
-///   "explicit_sync_fd"        — acquire fence as dma_fence sync_file (v1+).
-///   "drm_syncobj_release"     — release fence as drm_syncobj fd (v1+).
-///   "modifier_negotiation_v1" — consumer_caps + bind_failed plumbing (v2).
-const MANDATORY_FEATURES: &[&str] = &[
+/// Inclusive range of `client_protocol_version` values this daemon
+/// accepts. Bump these when extending the wire protocol; everything
+/// outside the range is rejected at handshake with
+/// `error{code = VERSION_UNSUPPORTED}`.
+pub const MIN_SUPPORTED_CLIENT_VERSION: u32 = PROTOCOL_VERSION;
+pub const MAX_SUPPORTED_CLIENT_VERSION: u32 = PROTOCOL_VERSION;
+
+/// Advertised in `welcome.features`. Advisory in v3+ — clients MUST
+/// NOT gate on these; the negotiated `client_protocol_version` is
+/// authoritative for what the daemon supports.
+const ADVERTISED_FEATURES: &[&str] = &[
     "explicit_sync_fd",
     "drm_syncobj_release",
     "modifier_negotiation_v1",
@@ -146,19 +152,22 @@ async fn do_handshake(
         protocol,
         client_name,
         client_version,
+        client_protocol_version,
     } = hello
     else {
         return Err(anyhow!("expected hello, got opcode {}", hello.opcode()));
     };
     if protocol != PROTOCOL_NAME {
         let s = stream.try_clone().context("clone for error")?;
-        let msg = format!("unsupported protocol: {protocol}");
+        let msg = format!(
+            "unsupported protocol: {protocol:?} (expected {PROTOCOL_NAME:?})"
+        );
         let err_msg = msg.clone();
         let _ = tokio::task::spawn_blocking(move || {
             codec::send_event(
                 &s,
                 &Event::Error {
-                    code: 1,
+                    code: error_code::PROTO_NAME_MISMATCH,
                     message: err_msg,
                 },
                 &[],
@@ -167,7 +176,31 @@ async fn do_handshake(
         .await;
         return Err(anyhow!("bad protocol string: {msg}"));
     }
-    log::info!("display hello: {client_name} v{client_version}");
+    if !(MIN_SUPPORTED_CLIENT_VERSION..=MAX_SUPPORTED_CLIENT_VERSION)
+        .contains(&client_protocol_version)
+    {
+        let s = stream.try_clone().context("clone for error")?;
+        let msg = format!(
+            "client protocol v{client_protocol_version} not supported; \
+             daemon accepts [{MIN_SUPPORTED_CLIENT_VERSION}..={MAX_SUPPORTED_CLIENT_VERSION}]"
+        );
+        let err_msg = msg.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            codec::send_event(
+                &s,
+                &Event::Error {
+                    code: error_code::VERSION_UNSUPPORTED,
+                    message: err_msg,
+                },
+                &[],
+            )
+        })
+        .await;
+        return Err(anyhow!("version mismatch: {msg}"));
+    }
+    log::info!(
+        "display hello: {client_name} v{client_version} (proto v{client_protocol_version})"
+    );
 
     let welcome_stream = stream.try_clone().context("clone for welcome")?;
     tokio::task::spawn_blocking(move || {
@@ -175,7 +208,7 @@ async fn do_handshake(
             &welcome_stream,
             &Event::Welcome {
                 server_version: SERVER_VERSION.to_string(),
-                features: MANDATORY_FEATURES.iter().map(|s| s.to_string()).collect(),
+                features: ADVERTISED_FEATURES.iter().map(|s| s.to_string()).collect(),
             },
             &[],
         )

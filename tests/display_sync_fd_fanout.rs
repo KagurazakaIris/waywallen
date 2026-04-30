@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use waywallen::display_endpoint;
-use waywallen::display_proto::{codec, Event, Request, PROTOCOL_NAME};
+use waywallen::display_proto::{codec, Event, Request, PROTOCOL_NAME, PROTOCOL_VERSION};
 use waywallen::renderer_manager::{RendererManager, SpawnRequest};
 use waywallen::routing::Router;
 
@@ -31,6 +31,7 @@ fn run_client(sock: &PathBuf, name: &str, n_frames: usize) -> anyhow::Result<usi
             protocol: PROTOCOL_NAME.to_string(),
             client_name: name.to_string(),
             client_version: "0.0.1".to_string(),
+            client_protocol_version: PROTOCOL_VERSION,
         },
         &[],
     )?;

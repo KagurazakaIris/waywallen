@@ -280,9 +280,10 @@ mod tests {
     fn request_hello_roundtrip() {
         let (a, b) = pair();
         let sent = Request::Hello {
-            protocol: "waywallen-display-v1".to_string(),
+            protocol: "waywallen-display-v3".to_string(),
             client_name: "client".to_string(),
             client_version: "0.1.0".to_string(),
+            client_protocol_version: 3,
         };
         send_request(&a, &sent, &[]).unwrap();
         let (got, _) = recv_request(&b).unwrap();
