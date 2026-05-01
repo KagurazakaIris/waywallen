@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <vector>
 
@@ -78,6 +80,13 @@ Producer::~Producer() {
 
 std::unique_ptr<Producer>
 Producer::create(uint32_t width, uint32_t height, std::string* err) {
+    return create_with_render_node(width, height, std::string{}, err);
+}
+
+std::unique_ptr<Producer>
+Producer::create_with_render_node(uint32_t width, uint32_t height,
+                                  const std::string& render_node,
+                                  std::string* err) {
     if (width == 0 || height == 0) {
         fail(err, "Producer: width/height must be non-zero");
         return nullptr;
@@ -125,18 +134,59 @@ Producer::create(uint32_t width, uint32_t height, std::string* err) {
         VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
     };
     static constexpr const char* DRM_EXT = "VK_EXT_physical_device_drm";
+
+    /* Iter 4: when `render_node` is set, only the device whose DRM
+     * render major:minor matches the requested path is acceptable. */
+    bool      pinning  = !render_node.empty();
+    dev_t     want_rdev = 0;
+    if (pinning) {
+        struct stat st {};
+        if (::stat(render_node.c_str(), &st) != 0) {
+            fail(err, std::string("Producer: stat(") + render_node + ") failed: " +
+                       std::strerror(errno));
+            return nullptr;
+        }
+        want_rdev = st.st_rdev;
+    }
+
+    auto vkGetPhysicalDeviceProperties2_ =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            vkGetInstanceProcAddr(self->instance_,
+                                  "vkGetPhysicalDeviceProperties2"));
+
+    bool have_drm_ext = false;
     for (auto pd : pds) {
         bool ok = true;
         for (const char* e : req_dev_exts) {
             if (!device_has_ext(pd, e)) { ok = false; break; }
         }
-        if (ok) { self->phys_ = pd; break; }
+        if (!ok) continue;
+
+        bool pd_has_drm = device_has_ext(pd, DRM_EXT);
+        if (pinning) {
+            if (!pd_has_drm || !vkGetPhysicalDeviceProperties2_) continue;
+            VkPhysicalDeviceDrmPropertiesEXT drm {};
+            drm.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
+            VkPhysicalDeviceProperties2 props {};
+            props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            props.pNext = &drm;
+            vkGetPhysicalDeviceProperties2_(pd, &props);
+            if (!drm.hasRender) continue;
+            const dev_t pd_rdev = makedev(static_cast<unsigned>(drm.renderMajor),
+                                          static_cast<unsigned>(drm.renderMinor));
+            if (pd_rdev != want_rdev) continue;
+        }
+
+        self->phys_   = pd;
+        have_drm_ext  = pd_has_drm;
+        break;
     }
     if (self->phys_ == VK_NULL_HANDLE) {
-        fail(err, "no physical device supports the DMA-BUF export extension set");
+        fail(err, pinning
+             ? std::string("Producer: no Vulkan device matches render_node ") + render_node
+             : std::string("no physical device supports the DMA-BUF export extension set"));
         return nullptr;
     }
-    bool have_drm_ext = device_has_ext(self->phys_, DRM_EXT);
 
     if (!pick_queue_family(self->phys_, &self->queue_family_)) {
         fail(err, "no suitable queue family");
@@ -174,10 +224,8 @@ Producer::create(uint32_t width, uint32_t height, std::string* err) {
         return nullptr;
     }
 
-    auto vkGetPhysicalDeviceProperties2_ =
-        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
-            vkGetInstanceProcAddr(self->instance_,
-                                  "vkGetPhysicalDeviceProperties2"));
+    /* The function pointer was loaded above for the device-pick pass;
+     * reuse it here for UUID + DRM property capture. */
     if (vkGetPhysicalDeviceProperties2_) {
         VkPhysicalDeviceIDProperties id_props {};
         id_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;

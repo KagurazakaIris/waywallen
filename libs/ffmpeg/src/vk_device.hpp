@@ -37,6 +37,18 @@ public:
     static std::unique_ptr<Producer>
     create(uint32_t width, uint32_t height, std::string* err);
 
+    // Iter 4 overload: pin the picked VkPhysicalDevice to the GPU that
+    // exposes `render_node` (e.g. "/dev/dri/renderD128"). Requires
+    // VK_EXT_physical_device_drm on the candidate device. Empty string
+    // → behaves identically to the no-arg overload (first device that
+    // advertises the required extension set wins). On mismatch the
+    // function fails rather than silently picking another GPU; render-
+    // node mismatch is a hard configuration error.
+    static std::unique_ptr<Producer>
+    create_with_render_node(uint32_t width, uint32_t height,
+                            const std::string& render_node,
+                            std::string* err);
+
     VkInstance       instance() const         { return instance_; }
     VkPhysicalDevice physical_device() const  { return phys_; }
     VkDevice         device() const           { return device_; }

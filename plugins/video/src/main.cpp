@@ -44,6 +44,7 @@ constexpr uint32_t SLOT_COUNT = 3;
 struct Options {
     std::string ipc_path;
     std::string video_path;
+    std::string render_node;   // e.g. "/dev/dri/renderD128"; empty → auto-pick
     uint32_t    width  { 1280 };
     uint32_t    height { 720 };
     bool        loop_file { true };
@@ -64,8 +65,9 @@ Options parse_args(int argc, char** argv) {
         };
         if (a == "--ipc")              o.ipc_path = next();
         else if (a == "--no-loop")     o.loop_file = false;
+        else if (a == "--render-node") o.render_node = next();
         else if (a == "--width" || a == "--height" || a == "--video"
-                 || a == "--path" || a == "--fps" || a == "--render-node") {
+                 || a == "--path" || a == "--fps") {
             (void)next();
         } else if (a == "--test-pattern") {
             // Bare bool — skip.
@@ -228,6 +230,12 @@ int main(int argc, char** argv) {
     if (const char* v = kv_get(init.settings, "loop_file")) {
         opt.loop_file = !(std::strcmp(v, "no") == 0);
     }
+    if (opt.render_node.empty()) {
+        if (const char* v = kv_get(init.settings, "render_node");
+            v && *v) {
+            opt.render_node = v;
+        }
+    }
     ww_bridge_init_free(&init);
     if (opt.video_path.empty())
         die("Init.resource_primary (video path) is required");
@@ -246,7 +254,8 @@ int main(int argc, char** argv) {
 
     /* --- Vulkan device + GPU YUV→RGB pipeline --- */
     std::string verr;
-    auto producer = waywallen::ffvk::Producer::create(even_w, even_h, &verr);
+    auto producer = waywallen::ffvk::Producer::create_with_render_node(
+        even_w, even_h, opt.render_node, &verr);
     if (!producer) die("vk producer: " + verr);
 
     ww_bridge_vk_dt_t vdt {};
