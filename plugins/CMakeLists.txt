@@ -2,14 +2,13 @@ cmake_minimum_required(VERSION 3.16)
 project(waywallen-plugins
     VERSION 0.1.0
     LANGUAGES C CXX
-    DESCRIPTION "waywallen renderer subprocess plugins (mpv, image, ...)"
+    DESCRIPTION "waywallen renderer subprocess plugins (image, video)"
 )
 
 # Toggle which plugins are built. Each defaults ON; turn an individual plugin
-# OFF if its native deps (libmpv, ffmpeg, Vulkan, ...) aren't available.
-option(WAYWALLEN_BUILD_MPV_PLUGIN   "Build the libmpv video plugin" ON)
+# OFF if its native deps (ffmpeg, Vulkan, glslang, ...) aren't available.
 option(WAYWALLEN_BUILD_IMAGE_PLUGIN "Build the ffmpeg+Vulkan image plugin" ON)
-option(WAYWALLEN_BUILD_VIDEO_PLUGIN "Build the ffmpeg+Vulkan video plugin (mpv replacement; coexists at lower priority)" ON)
+option(WAYWALLEN_BUILD_VIDEO_PLUGIN "Build the ffmpeg+Vulkan video plugin"  ON)
 
 # Resolve waywallen-bridge once so every plugin in this tree shares the same
 # target instead of rebuilding it per-subdir. Plugins that also stand alone
@@ -24,10 +23,6 @@ endif()
 # (libs/ffmpeg gates the rstd-dependent thumbnail target on rstd).
 if(NOT TARGET waywallen::ffmpeg_vk)
     add_subdirectory(../libs/ffmpeg waywallen-ffmpeg-build)
-endif()
-
-if(WAYWALLEN_BUILD_MPV_PLUGIN)
-    add_subdirectory(mpv)
 endif()
 
 if(WAYWALLEN_BUILD_IMAGE_PLUGIN)

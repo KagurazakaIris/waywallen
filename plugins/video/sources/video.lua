@@ -1,9 +1,8 @@
 -- video - waywallen source plugin for local video wallpapers.
 --
 -- Installed to <prefix>/share/waywallen/sources/video.lua. Emits entries
--- with wp_type = "video" that the daemon routes to waywallen-mpv-renderer.
--- Metadata `video` / `path` both carry the absolute file path; the daemon
--- forwards them as `--video <path>` and `--path <path>`.
+-- with wp_type = "video" that the daemon routes to waywallen-video-renderer.
+-- Metadata `video` / `path` both carry the absolute file path.
 
 local M = {}
 

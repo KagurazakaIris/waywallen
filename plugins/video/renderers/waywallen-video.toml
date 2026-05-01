@@ -1,19 +1,17 @@
-# waywallen-video — FFmpeg-based video renderer for waywallen.
+# waywallen-video — the canonical video renderer for waywallen.
 #
 # Pipeline: best-effort Vulkan hwdevice (FFmpeg AV_HWDEVICE_TYPE_VULKAN)
 # decode → sw landing frame → swscale to NV12 → GPU NV12→RGBA compute
 # pass into the bridge slot. PTS-driven pacing. render_node pins the
 # Vulkan physical device used for the compute pass.
 #
-# Iter 4 bumps priority above mpv's 100 — daemon now routes video
-# wallpapers here by default. Setting priority < 100 (or uninstalling
-# this manifest) reverts to mpv.
+# Successor to the libmpv plugin (removed in Iter 5).
 
 [renderer]
 name = "waywallen-video"
 bin = "../../../bin/waywallen-video-renderer"
 types = ["video"]
-priority = 150
+priority = 100
 spawn_version = 1
 
 [renderer.settings]

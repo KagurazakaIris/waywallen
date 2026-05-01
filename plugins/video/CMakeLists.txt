@@ -69,12 +69,11 @@ target_link_libraries(waywallen-video-renderer
 # Install layout matches the daemon's --plugin scan convention:
 #   <prefix>/bin/waywallen-video-renderer
 #   <prefix>/share/waywallen/renderers/waywallen-video.toml
+#   <prefix>/share/waywallen/sources/video.lua
 #
-# We deliberately do NOT install a sources/video.lua here in Iter 0 — the
-# mpv plugin already ships one and the daemon routes by manifest priority,
-# so two source plugins claiming the same `name` would just double-enumerate
-# the same files. Iter 5 (mpv removal) ships our own source.lua at that
-# point.
+# Iter 5: now that the mpv plugin is gone, this plugin owns the
+# `video` source plugin too — without it, the daemon has no way to
+# enumerate video files in the user's libraries.
 # ---------------------------------------------------------------------------
 
 include(GNUInstallDirs)
@@ -86,4 +85,9 @@ install(TARGETS waywallen-video-renderer
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/renderers/
     DESTINATION ${CMAKE_INSTALL_DATADIR}/waywallen/renderers
     FILES_MATCHING PATTERN "*.toml"
+)
+
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/sources/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/waywallen/sources
+    FILES_MATCHING PATTERN "*.lua"
 )

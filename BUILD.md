@@ -31,7 +31,7 @@ install/bin/
     waywallen-display-layer-shell      # wlroots adapter (Rust)
     waywallen-ui                       # Qt/QML UI
     waywallen-image-renderer           # C++ plugin
-    waywallen-mpv-renderer             # C++ plugin
+    waywallen-video-renderer           # C++ plugin (FFmpeg + Vulkan compute)
 install/share/waywallen/
     renderers/*.toml
     sources/*.lua
