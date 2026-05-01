@@ -66,6 +66,7 @@ target_link_libraries(waywallen-mpv-renderer
 # Install: matches the layout the waywallen daemon scans via --plugin.
 #   <prefix>/bin/waywallen-mpv-renderer
 #   <prefix>/share/waywallen/renderers/waywallen-mpv.toml
+#   <prefix>/share/waywallen/sources/video.lua
 # ---------------------------------------------------------------------------
 
 include(GNUInstallDirs)
@@ -77,4 +78,9 @@ install(TARGETS waywallen-mpv-renderer
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/renderers/
     DESTINATION ${CMAKE_INSTALL_DATADIR}/waywallen/renderers
     FILES_MATCHING PATTERN "*.toml"
+)
+
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/sources/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/waywallen/sources
+    FILES_MATCHING PATTERN "*.lua"
 )

@@ -576,4 +576,49 @@ return M
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "test");
     }
+
+    #[test]
+    fn video_source_plugin_discovers_video_files() {
+        let lib = tempfile::tempdir().unwrap();
+        let nested = lib.path().join("album");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(lib.path().join("clip.MP4"), b"video bytes").unwrap();
+        std::fs::write(lib.path().join("animated.gif"), b"image source owns gif").unwrap();
+        std::fs::write(nested.join("poster.png"), b"not a video").unwrap();
+        std::fs::write(nested.join("loop.webm"), b"more video bytes").unwrap();
+
+        let plugin_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/mpv/sources/video.lua");
+
+        let mut mgr = SourceManager::new().unwrap();
+        let name = mgr.load_plugin(&plugin_path).unwrap();
+        assert_eq!(name, "video");
+
+        let mut libs = HashMap::new();
+        libs.insert(
+            "video".to_string(),
+            vec![lib.path().to_string_lossy().to_string()],
+        );
+        mgr.scan_all(&libs).unwrap();
+
+        let entries = mgr.list();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.wp_type == "video"));
+        assert!(entries.iter().all(|e| e.plugin_name == "video"));
+        assert!(entries.iter().all(|e| e.preview.is_none()));
+        assert!(entries.iter().all(|e| e.size.is_some()));
+        assert!(entries.iter().all(|e| e.width.is_none()));
+        assert!(entries.iter().all(|e| e.height.is_none()));
+        assert!(entries.iter().all(|e| e.format.is_none()));
+
+        let clip_path = lib.path().join("clip.MP4").to_string_lossy().to_string();
+        let clip = mgr.get(&format!("video:{clip_path}")).unwrap();
+        assert_eq!(clip.name, "clip");
+        assert_eq!(clip.resource, clip_path);
+        assert_eq!(clip.metadata.get("video"), Some(&clip.resource));
+        assert_eq!(clip.metadata.get("path"), Some(&clip.resource));
+
+        assert_eq!(mgr.list_by_type("video").len(), 2);
+        assert!(mgr.list_by_type("image").is_empty());
+    }
 }
