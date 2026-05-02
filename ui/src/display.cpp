@@ -142,7 +142,7 @@ auto DisplayManager::get(quint64 id) const -> Display* {
 }
 
 void DisplayManager::replaceAll(const QList<proto::DisplayInfo>& list) {
-    cppstd::map<quint64, Display*> next_by_id;
+    std::map<quint64, Display*> next_by_id;
     QList<Display*>                next_ordered;
     next_ordered.reserve(list.size());
 

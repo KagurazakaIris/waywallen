@@ -8,9 +8,9 @@ export namespace waywallen
 {
 
 template<typename T>
-class ShareStore : public kstore::ShareStore<T, cppstd::pmr::polymorphic_allocator<T>> {
+class ShareStore : public kstore::ShareStore<T, std::pmr::polymorphic_allocator<T>> {
 public:
-    using base_type = kstore::ShareStore<T, cppstd::pmr::polymorphic_allocator<T>>;
+    using base_type = kstore::ShareStore<T, std::pmr::polymorphic_allocator<T>>;
     ShareStore(): base_type() {}
 };
 

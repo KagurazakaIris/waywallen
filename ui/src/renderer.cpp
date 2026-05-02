@@ -83,7 +83,7 @@ auto RendererManager::get(const QString& id) const -> Renderer* {
 }
 
 void RendererManager::replaceAll(const QList<proto::RendererInstance>& list) {
-    cppstd::map<QString, Renderer*> next_by_id;
+    std::map<QString, Renderer*> next_by_id;
     QList<Renderer*>                next_ordered;
     next_ordered.reserve(list.size());
 

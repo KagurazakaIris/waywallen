@@ -64,7 +64,7 @@ private:
     Box<ncrequest::WebSocketClient> m_client;
     Box<QProtobufSerializer>        m_serializer;
 
-    cppstd::map<quint64, cppstd::move_only_function<void(asio::error_code, proto::Response)>>
+    std::map<quint64, std::move_only_function<void(asio::error_code, proto::Response)>>
         m_handlers;
 
     Atomic<quint64>      m_serial;

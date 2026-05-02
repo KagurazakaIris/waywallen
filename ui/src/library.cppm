@@ -100,7 +100,7 @@ private:
     void handleEvent(const proto::Event& evt);
 
     QList<Library*>               m_ordered;  // sorted by id
-    cppstd::map<qint64, Library*> m_by_id;
+    std::map<qint64, Library*> m_by_id;
 };
 
 } // namespace waywallen

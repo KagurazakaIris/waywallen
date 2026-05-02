@@ -108,7 +108,7 @@ private:
     void handleEvent(const proto::Event& evt);
 
     QList<Renderer*>                m_ordered;  // sorted by id
-    cppstd::map<QString, Renderer*> m_by_id;
+    std::map<QString, Renderer*> m_by_id;
 };
 
 } // namespace waywallen

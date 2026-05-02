@@ -76,7 +76,7 @@ auto LibraryManager::get(qint64 id) const -> Library* {
 }
 
 void LibraryManager::replaceAll(const QList<proto::LibraryInstance>& list) {
-    cppstd::map<qint64, Library*> next_by_id;
+    std::map<qint64, Library*> next_by_id;
     QList<Library*>               next_ordered;
     next_ordered.reserve(list.size());
 

@@ -15,7 +15,7 @@ export namespace waywallen::model
 
 template<typename TItem, typename CRTP>
 using MetaListCRTP = kstore::QMetaListModelCRTP<TItem, CRTP, kstore::ListStoreType::Share,
-                                                cppstd::pmr::polymorphic_allocator<TItem>>;
+                                                std::pmr::polymorphic_allocator<TItem>>;
 
 class WallpaperListModel : public kstore::QGadgetListModel,
                            public MetaListCRTP<model::Wallpaper, WallpaperListModel> {
