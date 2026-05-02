@@ -1,8 +1,8 @@
 pragma ValueTypeBehavior: Assertable
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Shapes
+import QtQuick.Templates as T
 import Qcm.Material as MD
 import waywallen.ui as W
 
@@ -444,8 +444,8 @@ MD.Page {
                                     return ovr.fillmodeSet === true;
                                 }
                                 icon.name: MD.Token.icon.refresh
-                                ToolTip.visible: hovered
-                                ToolTip.text: "Revert to global default"
+                                T.ToolTip.visible: hovered
+                                T.ToolTip.text: "Revert to global default"
                                 onClicked: {
                                     if (! root.selected) return;
                                     layoutSetQuery.name = root.selected.name;
@@ -479,8 +479,8 @@ MD.Page {
                                     return ovr.alignSet === true;
                                 }
                                 icon.name: MD.Token.icon.refresh
-                                ToolTip.visible: hovered
-                                ToolTip.text: "Revert to global default"
+                                T.ToolTip.visible: hovered
+                                T.ToolTip.text: "Revert to global default"
                                 onClicked: {
                                     if (! root.selected) return;
                                     layoutSetQuery.name = root.selected.name;
@@ -536,8 +536,8 @@ MD.Page {
                                         color: parent.isCurrent ? MD.Token.color.on_primary : MD.Token.color.on_surface_variant
                                     }
 
-                                    ToolTip.visible: ma.containsMouse
-                                    ToolTip.text: root.kAlignTooltips[index]
+                                    T.ToolTip.visible: ma.containsMouse
+                                    T.ToolTip.text: root.kAlignTooltips[index]
 
                                     MouseArea {
                                         id: ma
