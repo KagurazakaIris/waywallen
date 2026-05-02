@@ -22,10 +22,36 @@ BUILD_DIR="$PROJECT_DIR/build/clang-release"
 APPDIR="$PROJECT_DIR/build/AppDir"
 INSTALL_DIR="$APPDIR/usr"          # AppDir's /usr is the cmake install prefix
 TOOLS_DIR="$PROJECT_DIR/build/_tools"
-APPIMAGE_OUT="$PROJECT_DIR/waywallen-x86_64.AppImage"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---- Compute the version string baked into the AppImage filename ----
+# Pull the canonical version from Cargo.toml; refine with git metadata so
+# successive dev builds at the same version don't all overwrite each other.
+# Override the entire tag with WAYWALLEN_BUILD_VERSION=foo for one-off names.
+WAYWALLEN_VERSION="$(awk -F'"' '/^version *= *"/ { print $2; exit }' "$PROJECT_DIR/Cargo.toml")"
+[[ -n "$WAYWALLEN_VERSION" ]] || fail "could not parse version from Cargo.toml"
+
+if [[ -n "${WAYWALLEN_BUILD_VERSION:-}" ]]; then
+    BUILD_TAG="$WAYWALLEN_BUILD_VERSION"
+elif git -C "$PROJECT_DIR" rev-parse --short=7 HEAD >/dev/null 2>&1; then
+    SHA="$(git -C "$PROJECT_DIR" rev-parse --short=7 HEAD)"
+    DIRTY=""
+    git -C "$PROJECT_DIR" diff --quiet --ignore-submodules HEAD 2>/dev/null || DIRTY="-dirty"
+    if [[ -z "$DIRTY" ]] \
+        && git -C "$PROJECT_DIR" describe --tags --exact-match --match "v$WAYWALLEN_VERSION" \
+                >/dev/null 2>&1; then
+        BUILD_TAG="$WAYWALLEN_VERSION"
+    else
+        BUILD_TAG="$WAYWALLEN_VERSION-g$SHA$DIRTY"
+    fi
+else
+    BUILD_TAG="$WAYWALLEN_VERSION"
+fi
+
+APPIMAGE_OUT="$PROJECT_DIR/waywallen-$BUILD_TAG-x86_64.AppImage"
+step "Building AppImage tagged as $BUILD_TAG"
 
 # ---- 1. Check required tools ----
 command -v conda >/dev/null \
