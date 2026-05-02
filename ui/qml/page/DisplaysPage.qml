@@ -319,45 +319,40 @@ MD.Page {
                 }
 
                 MD.Text {
-                    text: "Bindings"
+                    text: "Connected renderer"
                     typescale: MD.Token.typescale.title_small
                     color: MD.Token.color.on_surface
                 }
 
-                MD.Text {
+                RowLayout {
+                    readonly property string connectedId: {
+                        if (!root.selected) return "";
+                        const links = root.selected.links || [];
+                        return links.length > 0 ? (links[0].rendererId || "") : "";
+                    }
                     Layout.fillWidth: true
-                    visible: !!root.selected && (!root.selected.links || root.selected.links.length === 0)
-                    text: "Idle — no renderer bound."
-                    typescale: MD.Token.typescale.body_small
-                    color: MD.Token.color.on_surface_variant
-                    wrapMode: Text.WordWrap
-                }
+                    spacing: 8
 
-                Repeater {
-                    model: root.selected ? root.selected.links : []
-                    delegate: RowLayout {
-                        required property var modelData
+                    MD.Icon {
+                        name: parent.connectedId.length > 0
+                            ? MD.Token.icon.play_arrow
+                            : MD.Token.icon.pause
+                        size: 18
+                        color: parent.connectedId.length > 0
+                            ? MD.Token.color.primary
+                            : MD.Token.color.on_surface_variant
+                    }
+                    MD.Text {
                         Layout.fillWidth: true
-                        spacing: 8
-
-                        MD.Icon {
-                            name: MD.Token.icon.play_arrow
-                            size: 18
-                            color: MD.Token.color.primary
-                        }
-                        MD.Text {
-                            Layout.fillWidth: true
-                            text: modelData.rendererId
-                            typescale: MD.Token.typescale.body_small
-                            color: MD.Token.color.on_surface
-                            font.family: "monospace"
-                            elide: Text.ElideMiddle
-                        }
-                        MD.Text {
-                            text: "z=" + modelData.zOrder
-                            typescale: MD.Token.typescale.label_small
-                            color: MD.Token.color.on_surface_variant
-                        }
+                        text: parent.connectedId.length > 0
+                            ? parent.connectedId
+                            : "Idle — no renderer connected."
+                        typescale: MD.Token.typescale.body_small
+                        color: parent.connectedId.length > 0
+                            ? MD.Token.color.on_surface
+                            : MD.Token.color.on_surface_variant
+                        font.family: parent.connectedId.length > 0 ? "monospace" : ""
+                        elide: Text.ElideMiddle
                     }
                 }
 

@@ -198,7 +198,8 @@ MD.Page {
                     }
 
                     SectionHint {
-                        visible: !rendererQuery.instances || rendererQuery.instances.length === 0
+                        readonly property var liveRenderers: W.App.rendererManager.renderers
+                        visible: !liveRenderers || liveRenderers.length === 0
                         text: rendererQuery.querying ? "Loading…" : "No active renderers"
                     }
 
@@ -209,7 +210,11 @@ MD.Page {
                         interactive: false
                         spacing: 4
 
-                        model: rendererQuery.instances
+                        // Live, push-updated. Backend events (RendererSnapshot /
+                        // RendererChanged / RendererRemoved) flow through
+                        // RendererManager so a child process exiting drops out of
+                        // this list without needing a manual refresh.
+                        model: W.App.rendererManager.renderers
 
                         delegate: MD.ListItem {
                             required property var modelData
@@ -321,7 +326,7 @@ MD.Page {
                             Layout.fillWidth: true
                         }
                         MD.IconButton {
-                            icon.name: MD.Token.icon.settings
+                            icon.name: MD.Token.icon.hard_drive
                             onClicked: MD.Util.showPopup('waywallen.ui/PagePopup', {
                                 source: 'waywallen.ui/SourceManagePage'
                             }, root)
