@@ -245,6 +245,35 @@
     <arg name="message" type="string"/>
   </request>
 
+  <!--
+    Pointer / mouse event forwarded from the consumer (display) to the
+    manager. **Reserved**: the manager currently logs at debug and
+    drops. Future work will route these to interactive renderers
+    (parallax, click-through, in-wallpaper widgets).
+
+    `kind` discriminates the payload:
+      0 — motion          (x, y are the new cursor position in surface px)
+      1 — button_press    (x, y at press; `properties.button=<u32>`)
+      2 — button_release  (x, y at release; `properties.button=<u32>`)
+      3 — axis_v          (`properties.delta=<f32>` vertical wheel delta)
+      4 — axis_h          (`properties.delta=<f32>` horizontal wheel delta)
+
+    `x` / `y` are surface-local pixel coordinates with origin at the
+    top-left of the consumer's advertised display extent (i.e. the
+    same coordinate space `register_display`'s `width`/`height` are
+    measured in). Sub-pixel precision allowed for HiDPI compositors.
+
+    `properties` is a forward-compat kv bag for fields that v5 does
+    not promote to typed args (button id, axis delta, modifier mask,
+    timestamp_us, etc.). The manager treats unknown keys as advisory.
+  -->
+  <request name="mouse_event" opcode="8">
+    <arg name="kind" type="u32"/>
+    <arg name="x" type="f32"/>
+    <arg name="y" type="f32"/>
+    <arg name="properties" type="kv_list"/>
+  </request>
+
 
   <!-- ==================================================================
        EVENTS  (manager -> display)

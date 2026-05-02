@@ -89,6 +89,22 @@ mod tests {
     }
 
     #[test]
+    fn request_mouse_event_roundtrip() {
+        roundtrip_req(Request::MouseEvent {
+            kind: 0,
+            x: 123.5,
+            y: 456.25,
+            properties: vec![],
+        });
+        roundtrip_req(Request::MouseEvent {
+            kind: 1,
+            x: 0.0,
+            y: 0.0,
+            properties: vec![("button".to_string(), "1".to_string())],
+        });
+    }
+
+    #[test]
     fn event_welcome_roundtrip() {
         roundtrip_evt(Event::Welcome {
             server_version: "waywallen 0.1.0".to_string(),

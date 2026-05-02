@@ -371,6 +371,14 @@ async fn run_frame_loop(
                     log::info!("display {display_id}: bye");
                     break Ok(());
                 }
+                Some(Ok(Request::MouseEvent { kind, x, y, properties: _ })) => {
+                    // Reserved — wire format is final but the router does
+                    // not consume mouse events yet. Future work will fan
+                    // these out to interactive renderers.
+                    log::debug!(
+                        "display {display_id}: mouse_event kind={kind} x={x} y={y} (reserved, dropped)"
+                    );
+                }
                 Some(Ok(other)) => {
                     log::warn!(
                         "display {display_id}: unexpected request opcode {}",
