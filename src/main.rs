@@ -431,6 +431,34 @@ async fn async_main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("plugin load join: {e}"))?;
 
+            // Step 1.5 — register loaded plugins in `source_plugin` so
+            // `auto_detect_libraries` can resolve them by name even on
+            // first boot (no libraries configured yet → step 2 below
+            // skips `refresh_sources`, which would otherwise be the
+            // first place an `upsert_plugin` runs).
+            {
+                let infos = {
+                    let sm = state_for_task.source_manager.lock().await;
+                    sm.plugins()
+                };
+                match infos {
+                    Ok(infos) => {
+                        for info in infos {
+                            if let Err(e) = crate::model::repo::upsert_plugin(
+                                &state_for_task.db,
+                                &info.name,
+                                &info.version,
+                            )
+                            .await
+                            {
+                                log::warn!("upsert plugin {}: {e:#}", info.name);
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("enumerate loaded plugins: {e:#}"),
+                }
+            }
+
             // Step 2 — scan against DB-driven libraries + sync results
             // + seed the playlist. Skip when no libraries are
             // configured: a brand-new user has nothing to scan, and
