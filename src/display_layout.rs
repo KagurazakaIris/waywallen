@@ -2,19 +2,6 @@
 //! fillmode, align)` tuple into the `source_rect` / `dest_rect` /
 //! `clear_color` triple the wire-level `set_config` event carries.
 //!
-//! The daemon owns this computation. Consumers (libwaywallen_display,
-//! KDE plugin, layer-shell adapter) keep operating on the same
-//! geometric `set_config` payload they already do — no protocol
-//! change.
-//!
-//! `FillMode` enum names mirror Plasma's wallpaper plugin enum
-//! (Stretched / PreserveAspectFit / PreserveAspectCrop / Tiled /
-//! TiledOnlyHorizontally / TiledOnlyVertically / Centered) so the
-//! daemon API maps 1:1 onto Plasma plugins. `Stretched` /
-//! `PreserveAspectFit` / `PreserveAspectCrop` overlap semantically
-//! with `open-wallpaper-engine`'s `enum class FillMode { STRETCH,
-//! ASPECTFIT, ASPECTCROP }` (`open-wallpaper-engine/src/Type.hpp:86`).
-//!
 //! Tiled variants need sampler wrap or multiple draws and cannot be
 //! expressed as a single `(source_rect, dest_rect)` pair on the
 //! current wire format. They are accepted at the API surface (so
