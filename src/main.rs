@@ -169,7 +169,19 @@ pub fn spawn_ui(state: &AppState) -> bool {
         None => return false,
     };
     log::info!("launching ui: {}", ui_bin.display());
-    match std::process::Command::new(&ui_bin).spawn() {
+    // Clear proxy environment variables for the UI process to avoid proxy interference
+    // with local WebSocket connection.
+    let mut cmd = std::process::Command::new(&ui_bin);
+    // Remove common proxy environment variables
+    cmd.env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("NO_PROXY");
+    match cmd.spawn() {
         Ok(child) => {
             log::info!("ui pid: {}", child.id());
             true
@@ -595,7 +607,8 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Bind the WS control plane (port 0 = OS picks an available port).
-    let bind_addr = format!("0.0.0.0:{}", cli.ws_port);
+    // Use localhost to avoid proxy interference and for security.
+    let bind_addr = format!("127.0.0.1:{}", cli.ws_port);
     let (local_addr, ws_fut) = ws_server::bind(state.clone(), &bind_addr).await?;
     let ws_port = local_addr.port();
     state
