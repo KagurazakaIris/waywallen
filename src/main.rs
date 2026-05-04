@@ -217,6 +217,16 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
     let cli = parse_args();
 
+    let ui_bin: Option<PathBuf> = if cli.no_ui {
+        None
+    } else {
+        resolve_ui_path(cli.ui_path.clone())
+    };
+
+    // Single-instance gate. 
+    let dbus_conn = dbus_iface::acquire_or_handoff(ui_bin.as_deref()).await;
+    log::info!("DBus name acquired: {}", dbus_iface::BUS_NAME);
+
     let mut registry = plugin::renderer_registry::build_default_registry()
         .expect("failed to build renderer registry");
 
@@ -593,51 +603,37 @@ async fn async_main() -> anyhow::Result<()> {
         .store(ws_port, std::sync::atomic::Ordering::SeqCst);
     log::info!("ws port: {ws_port}");
 
-    // Resolve + stash the UI path, and launch once at startup (unless --no-ui).
-    if !cli.no_ui {
-        if let Some(ui_bin) = resolve_ui_path(cli.ui_path) {
-            *state.ui_path.lock().unwrap() = Some(ui_bin);
-            spawn_ui(&state);
-        } else {
-            log::info!("waywallen-ui not found, running headless");
-        }
+    // Stash the pre-resolved UI path and launch once at startup.
+    if let Some(ui_bin) = ui_bin {
+        *state.ui_path.lock().unwrap() = Some(ui_bin);
+        spawn_ui(&state);
+    } else if !cli.no_ui {
+        log::info!("waywallen-ui not found, running headless");
     }
 
-    // Session-bus presence: publish org.waywallen.waywallen.Daemon so consumers can
-    // detect daemon (re)start via NameOwnerChanged / Ready and reconnect
-    // immediately instead of waiting for their local backoff. Optional —
-    // if the session bus is absent (e.g. TTY, embedded) we keep running.
-    let dbus_conn = match dbus_iface::connect(
+    // Publish the Daemon1 interface on the connection we already own.
+    let dbus_conn = dbus_iface::serve(
+        dbus_conn,
         state.clone(),
         display_sock_path.to_string_lossy().into_owned(),
     )
     .await
-    {
-        Ok(conn) => {
-            log::info!("DBus name acquired: {}", dbus_iface::BUS_NAME);
-            if let Err(e) = dbus_iface::emit_ready(&conn).await {
-                log::warn!("DBus Ready emit failed: {e}");
-            }
-            Some(conn)
-        }
-        Err(e) => {
-            log::warn!("DBus session bus unavailable: {e} (continuing headless)");
-            None
-        }
-    };
+    .context("publish DBus interface")?;
+    if let Err(e) = dbus_iface::emit_ready(&dbus_conn).await {
+        log::warn!("DBus Ready emit failed: {e}");
+    }
 
-    // Tray icon (StatusNotifierItem) — best-effort. Requires a session bus
-    // and a StatusNotifierWatcher (Plasma, AppIndicator extension, waybar
+    // Tray icon (StatusNotifierItem) — best-effort. Requires a
+    // StatusNotifierWatcher (Plasma, AppIndicator extension, waybar
     // tray, ...). No host ⇒ warn & keep running headless.
     if !cli.no_tray {
-        if let Some(conn) = dbus_conn.clone() {
-            let state_t = state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = tray::spawn(conn, state_t).await {
-                    log::warn!("tray: {e} (continuing without tray)");
-                }
-            });
-        }
+        let conn = dbus_conn.clone();
+        let state_t = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tray::spawn(conn, state_t).await {
+                log::warn!("tray: {e} (continuing without tray)");
+            }
+        });
     }
 
     // SIGTERM (default `kill <pid>`, systemd stop) needs an explicit
@@ -681,10 +677,8 @@ async fn async_main() -> anyhow::Result<()> {
     // and the next daemon start can't restore playback.
     state.settings.flush_now().await;
 
-    if let Some(conn) = dbus_conn.as_ref() {
-        if let Err(e) = dbus_iface::emit_shutting_down(conn).await {
-            log::warn!("DBus ShuttingDown emit failed: {e}");
-        }
+    if let Err(e) = dbus_iface::emit_shutting_down(&dbus_conn).await {
+        log::warn!("DBus ShuttingDown emit failed: {e}");
     }
     drop(dbus_conn);
 

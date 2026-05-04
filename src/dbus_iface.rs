@@ -1,18 +1,10 @@
 //! Session-bus presence + control surface for the daemon.
-//!
-//! Consumers (e.g. the KDE wallpaper plugin wrapping
-//! `waywallen-display`) watch `org.freedesktop.DBus.NameOwnerChanged` for
-//! our well-known name to drive immediate reconnects without waiting for
-//! their local backoff timer.
-//!
-//! The bus is **optional** — if `Connection::session()` fails we log a
-//! warning and continue. Nothing in the daemon's data path depends on it.
-//!
-//! Methods here are thin wrappers around `crate::control`; the tray menu
-//! hits those functions directly without bouncing through D-Bus.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use zbus::fdo::RequestNameFlags;
+use zbus::names::WellKnownName;
 use zbus::{interface, Connection, SignalContext};
 
 use crate::control;
@@ -210,13 +202,57 @@ impl Daemon1 {
     async fn shutting_down(emitter: &SignalContext<'_>) -> zbus::Result<()>;
 }
 
-/// Connect to the session bus, publish the interface, and claim
-/// `org.waywallen.waywallen.Daemon`. Returns the `Connection` so the caller can keep
-/// it alive for the process lifetime and emit signals through it.
+/// Single-instance gate. Connects to the session bus and tries to claim
+/// `BUS_NAME` with `DO_NOT_QUEUE`. Three outcomes:
 ///
-/// On any failure (no session bus, name already owned, …) returns `Err`;
-/// the caller should log and continue headless.
-pub async fn connect(
+/// * primary owner ⇒ returns the live `Connection` (caller serves the
+///   interface on it later via [`serve`]).
+/// * name already taken ⇒ `execv`s into `ui_path`. The current PID
+///   becomes the UI process so desktop integration (startup notification
+///   cookie, systemd transient unit, taskbar grouping) stays attached to
+///   the user's launch. `ui_path = None` ⇒ exits 0.
+/// * session bus unavailable / `RequestName` errored ⇒ exits 1. Without
+///   a session bus we can't enforce single-instance.
+pub async fn acquire_or_handoff(ui_path: Option<&Path>) -> Connection {
+    let conn = match Connection::session().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("waywallen: dbus session bus unavailable: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let name: WellKnownName<'_> = WellKnownName::try_from(BUS_NAME).expect("valid bus name");
+    // zbus 4 maps the `Exists` / `InQueue` reply codes to
+    // `Error::NameTaken` / `Error::NameInQueue`; only `PrimaryOwner`
+    // and `AlreadyOwner` come back as `Ok`.
+    match conn
+        .request_name_with_flags(name, RequestNameFlags::DoNotQueue.into())
+        .await
+    {
+        Ok(_) => conn,
+        Err(zbus::Error::NameTaken) => {
+            let Some(ui) = ui_path else {
+                eprintln!("waywallen: already running, no UI to launch");
+                std::process::exit(0);
+            };
+            log::info!("waywallen already running; exec into {}", ui.display());
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(ui).exec();
+            eprintln!("waywallen: exec {} failed: {err}", ui.display());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("waywallen: dbus RequestName failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Publish the `Daemon1` interface on a connection that already owns
+/// `BUS_NAME` (returned by [`acquire_or_handoff`]).
+pub async fn serve(
+    conn: Connection,
     app: Arc<AppState>,
     display_socket_path: String,
 ) -> zbus::Result<Arc<Connection>> {
@@ -224,11 +260,7 @@ pub async fn connect(
         app,
         display_socket_path,
     };
-    let conn = zbus::connection::Builder::session()?
-        .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, iface)?
-        .build()
-        .await?;
+    conn.object_server().at(OBJECT_PATH, iface).await?;
     Ok(Arc::new(conn))
 }
 
